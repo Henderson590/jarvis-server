@@ -1,0 +1,22 @@
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Local data Jarvis creates at runtime
+jarvis_todos.json
+jarvis_notes.json
+jarvis_reminders.json
+jarvis_settings.json
+jarvis_memory.db
+screenshot.png
+
+# Editor/OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

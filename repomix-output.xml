@@ -1,0 +1,5038 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+assistant/
+  agent/
+    __init__.py
+    planner.py
+    registry.py
+    tools_blender.py
+    tools_files.py
+    tools_memory.py
+    tools_productivity.py
+    tools_system.py
+    tools_vision.py
+    tools_web.py
+  memory/
+    __init__.py
+    db.py
+    store.py
+  __init__.py
+  audio_devices.py
+  blender_integration.py
+  brain.py
+  computer.py
+  file_ops.py
+  math_helper.py
+  notes.py
+  reminders.py
+  settings.py
+  stt.py
+  tts.py
+  vision.py
+  wake_word.py
+  weather.py
+  web_search.py
+.env.example
+.gitignore
+config.py
+main.py
+README.md
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="assistant/agent/__init__.py">
+"""
+Agent core (Phase 1): tool-calling planner that replaced the old regex-cascade
+brain.py. See planner.py for the loop, registry.py for the tool contract, and
+tools_*.py for the actual capabilities.
+"""
+from .planner import process  # noqa: F401
+from . import registry  # noqa: F401
+</file>
+
+<file path="assistant/agent/planner.py">
+"""
+The planner: an agentic tool-calling loop.
+
+Replaces the old regex-cascade brain.py. Instead of matching ~40 hand-written
+regex patterns against the user's exact phrasing, the LLM is given a registry
+of tools (JSON-schema function definitions) and decides which ones to call,
+in what order, with what arguments. This is what lets the assistant handle
+paraphrasing, multi-step requests, and new capabilities without brain.py
+growing forever - adding a capability now means adding a tool, not another
+regex branch.
+
+Flow per user turn:
+  1. If a tool call is awaiting yes/no confirmation from last turn, resolve that first.
+  2. Otherwise, send the conversation + tool schemas to Ollama.
+  3. If the model responds with tool call(s), execute each (or pause for
+     confirmation if the tool requires it), feed results back, and loop.
+  4. Stop when the model responds with plain text instead of a tool call, or
+     after a small iteration cap (a safety valve against infinite tool loops).
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Optional
+
+import config
+
+from . import registry
+# Import so their @tool decorators run and register into the registry.
+from . import tools_system      # noqa: F401
+from . import tools_files       # noqa: F401
+from . import tools_web         # noqa: F401
+from . import tools_productivity  # noqa: F401
+from . import tools_vision      # noqa: F401
+from . import tools_blender     # noqa: F401
+from . import tools_memory      # noqa: F401
+from ..memory import store as memory_store
+
+_HISTORY_SIZE = getattr(config, "CONVERSATION_HISTORY_SIZE", 4)
+_STRIP_ROLEPLAY = getattr(config, "STRIP_ROLEPLAY", True)
+_MAX_TOOL_ITERATIONS = 6
+# Keeps the model resident in Ollama between requests instead of unloading after
+# its default 5-minute idle timeout - reloading a multi-GB model from disk is
+# usually the single biggest source of slow responses, far more than generation
+# time itself. See config.OLLAMA_KEEP_ALIVE.
+_KEEP_ALIVE = getattr(config, "OLLAMA_KEEP_ALIVE", "30m")
+
+_conversation_history: list[dict] = []
+_pending_confirmation: Optional[dict] = None  # {"tool": name, "args": {...}}
+
+_AFFIRM_RE = re.compile(r"^\s*(yes|yeah|yep|yup|confirm(ed)?|do it|go ahead|proceed|sure|ok(ay)?)\b", re.I)
+_DENY_RE = re.compile(r"^\s*(no|nope|cancel|stop|don'?t|do not|never ?mind)\b", re.I)
+
+_SYSTEM_PROMPT = (
+    "You are Jarvis, a local desktop AI assistant with tools that actually perform actions "
+    "on the user's computer: opening apps, controlling the mouse and keyboard, reading and "
+    "writing files, browsing the web, checking weather, doing math, managing notes/reminders/"
+    "timers, looking through the camera or at the screen, and generating simple 3D scenes in "
+    "Blender.\n\n"
+    "Rules:\n"
+    "- If a tool can accomplish what the user asked, call it. Don't just describe what you "
+    "would do.\n"
+    "- You may call multiple tools in sequence for multi-step requests.\n"
+    "- After tools run, give a short, direct, spoken-style confirmation. Don't dump raw tool "
+    "output verbatim if it's long - summarize it.\n"
+    "- If the user is just chatting or asking something you can answer directly, answer "
+    "directly - don't force a tool call that isn't needed.\n"
+    "- Never use asterisks, *actions*, roleplay descriptions, or emoji. Plain spoken text only.\n"
+    "- Be confident and direct, with occasional dry humor. Never robotic, never chatty filler.\n\n"
+    "Memory: you have persistent memory tools (remember_fact, remember_preference, "
+    "remember_procedure, forget_fact, list_what_you_know). When the user tells you something "
+    "worth keeping long-term - a fact about them, a favorite tool/app, or how they like a task "
+    "done - call the right remember_* tool quietly and continue; don't ask permission first for "
+    "ordinary facts. Only use forget_fact when the user explicitly asks to forget something. "
+    "Anything relevant that's already remembered will appear below as context - use it, don't "
+    "ask the user to repeat what they've already told you."
+)
+
+
+def _sanitize_response(text: str) -> str:
+    if not text or not _STRIP_ROLEPLAY:
+        return (text or "").strip()
+    out = text
+    out = re.sub(r"\*\*(.+?)\*\*", r"\1", out)
+    out = re.sub(r"\*([^*]+?)\*", r"\1", out)
+    out = out.replace("*", "")
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _push_history(role: str, content: str) -> None:
+    if _HISTORY_SIZE <= 0:
+        return
+    _conversation_history.append({"role": role, "content": content})
+    if len(_conversation_history) > _HISTORY_SIZE * 2:
+        _conversation_history[:] = _conversation_history[-(_HISTORY_SIZE * 2):]
+
+
+def _execute(name: str, args: dict) -> str:
+    t = registry.get_tool(name)
+    if t is None:
+        return f"Unknown tool: {name}"
+    try:
+        return str(t.func(**args))
+    except TypeError as e:
+        return f"Tool '{name}' got bad arguments: {e}"
+    except Exception as e:
+        return f"Tool '{name}' failed: {e}"
+
+
+def _run_pending_confirmation(user_message: str) -> Optional[str]:
+    """If a confirm-required tool call is waiting on a yes/no, resolve it now.
+    Returns a reply string if this turn was consumed by confirmation handling,
+    otherwise None (meaning: treat user_message as a normal new turn)."""
+    global _pending_confirmation
+    pending = _pending_confirmation
+    _pending_confirmation = None
+
+    if _AFFIRM_RE.match(user_message):
+        result = _execute(pending["tool"], pending["args"])
+        reply = _sanitize_response(f"Confirmed. {result}")
+        _push_history("user", user_message)
+        _push_history("assistant", reply)
+        _log_turn(user_message, [pending["tool"]], reply)
+        return reply
+
+    if _DENY_RE.match(user_message):
+        reply = "Cancelled."
+        _push_history("user", user_message)
+        _push_history("assistant", reply)
+        _log_turn(user_message, [], reply)
+        return reply
+
+    return None  # ambiguous reply - drop the pending confirmation, treat as new turn
+
+
+def _log_turn(user_message: str, tool_names: list[str], final_reply: str) -> None:
+    try:
+        if tool_names:
+            summary = f"User: {user_message[:150]} | Used: {', '.join(tool_names)} | Reply: {final_reply[:150]}"
+        else:
+            summary = f"User: {user_message[:150]} | Reply: {final_reply[:150]}"
+        memory_store.log_episodic(summary)
+    except Exception:
+        pass  # memory logging should never break a response
+
+
+def process(user_message: str) -> str:
+    """Main entry point for one user turn. Runs the tool-calling loop and
+    returns the final spoken-style reply."""
+    global _pending_confirmation
+
+    try:
+        import ollama
+    except ImportError as e:
+        return (
+            f"Can't import the 'ollama' package ({e}). If 'pip list' shows it installed "
+            "anyway, this is almost always a broken/mismatched dependency (often "
+            "pydantic-core) rather than a missing package - check your Python version "
+            "matches what your packages were built for. See README troubleshooting."
+        )
+
+    if _pending_confirmation is not None:
+        resolved = _run_pending_confirmation(user_message)
+        if resolved is not None:
+            return resolved
+        # else: fall through and treat user_message as a fresh turn
+
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    try:
+        memory_block = memory_store.build_context_block(user_message)
+    except Exception:
+        memory_block = ""
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
+    if _HISTORY_SIZE > 0:
+        messages.extend(_conversation_history[-_HISTORY_SIZE:])
+    messages.append({"role": "user", "content": user_message})
+
+    tools_schema = registry.ollama_tool_schemas()
+    final_reply = None
+    tools_used: list[str] = []
+
+    for _ in range(_MAX_TOOL_ITERATIONS):
+        try:
+            response = ollama.chat(
+                model=config.OLLAMA_CHAT_MODEL,
+                messages=messages,
+                tools=tools_schema,
+                keep_alive=_KEEP_ALIVE,
+            )
+        except Exception as e:
+            final_reply = f"Ollama error: {e}. Is Ollama running? (ollama serve)"
+            break
+
+        msg = response.get("message", {}) if isinstance(response, dict) else dict(response.get("message", {}))
+        tool_calls = msg.get("tool_calls") or []
+
+        if not tool_calls:
+            final_reply = (msg.get("content") or "").strip()
+            break
+
+        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
+
+        awaiting_confirmation = False
+        for call in tool_calls:
+            fn = call.get("function", {})
+            name = fn.get("name", "")
+            raw_args = fn.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except Exception:
+                    args = {}
+            else:
+                args = dict(raw_args or {})
+
+            t = registry.get_tool(name)
+            if t is not None and t.confirm:
+                _pending_confirmation = {"tool": name, "args": args}
+                final_reply = f"That's a {name.replace('_', ' ')} action - want me to go ahead? (yes/no)"
+                awaiting_confirmation = True
+                break
+
+            tools_used.append(name)
+            result = _execute(name, args)
+            messages.append({"role": "tool", "content": result, "name": name})
+
+        if awaiting_confirmation:
+            break
+    else:
+        final_reply = "That's turning into a lot of steps - what exactly do you want me to do?"
+
+    if not final_reply:
+        final_reply = "Done."
+
+    final_reply = _sanitize_response(final_reply)
+    _push_history("user", user_message)
+    _push_history("assistant", final_reply)
+    _log_turn(user_message, tools_used, final_reply)
+    return final_reply
+</file>
+
+<file path="assistant/agent/registry.py">
+"""
+Tool registry for the agent core.
+
+Any module that wants to expose a capability to the planner defines a plain
+Python function and decorates it with @tool(...). That's the entire plugin
+contract for built-in tools: register a function, describe its parameters in
+JSON-schema form, and the planner can call it. This is also the pattern
+Phase 3's external plugin loader will reuse for third-party plugins.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    func: Callable[..., str]
+    parameters: dict = field(default_factory=dict)   # JSON-schema "properties"
+    required: list = field(default_factory=list)      # required property names
+    confirm: bool = False                              # ask user before running
+
+    def to_ollama_schema(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": self.parameters,
+                    "required": self.required,
+                },
+            },
+        }
+
+
+_REGISTRY: dict[str, Tool] = {}
+
+
+def tool(
+    name: str,
+    description: str,
+    parameters: Optional[dict] = None,
+    required: Optional[list] = None,
+    confirm: bool = False,
+):
+    """
+    Decorator that registers a function as a tool the planner can call.
+
+    parameters: JSON-schema "properties" dict, e.g.
+        {"city": {"type": "string", "description": "City name or zip code"}}
+    required: list of property names the model must always provide.
+    confirm: if True, the planner will ask the user to confirm before running
+        this tool (use for purchases, deletions, or anything hard to undo).
+    """
+    def decorator(func: Callable[..., str]) -> Callable[..., str]:
+        if name in _REGISTRY:
+            raise ValueError(f"Tool '{name}' is already registered (duplicate name).")
+        _REGISTRY[name] = Tool(
+            name=name,
+            description=description,
+            func=func,
+            parameters=parameters or {},
+            required=required or [],
+            confirm=confirm,
+        )
+        return func
+    return decorator
+
+
+def get_tool(name: str) -> Optional[Tool]:
+    return _REGISTRY.get(name)
+
+
+def all_tools() -> list[Tool]:
+    return list(_REGISTRY.values())
+
+
+def ollama_tool_schemas() -> list[dict]:
+    return [t.to_ollama_schema() for t in _REGISTRY.values()]
+
+
+def clear_registry() -> None:
+    """Only for tests - wipes registered tools."""
+    _REGISTRY.clear()
+</file>
+
+<file path="assistant/agent/tools_blender.py">
+"""Blender integration: turns a natural-language scene description into a simple
+primitive layout and opens it in Blender. This is intentionally basic for now -
+mesh repair, manifold checks, and STL export are Phase 8 work."""
+from __future__ import annotations
+
+import json
+import re
+
+import config
+from .. import blender_integration
+from .registry import tool
+
+_SPEC_PROMPT = (
+    "Convert this 3D scene request into JSON only, no other text. Format:\n"
+    '{"objects": [{"type": "cube"|"sphere"|"plane", "location": [x,y,z], "scale": [x,y,z]}]}\n'
+    "Use reasonable coordinates so objects don't overlap. Request: "
+)
+
+
+def _spec_from_description(description: str) -> dict:
+    try:
+        import ollama
+        response = ollama.chat(
+            model=config.OLLAMA_CHAT_MODEL,
+            messages=[{"role": "user", "content": _SPEC_PROMPT + description}],
+            keep_alive=getattr(config, "OLLAMA_KEEP_ALIVE", "30m"),
+        )
+        text = (response.get("message", {}).get("content") or "").strip()
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            return json.loads(match.group(0))
+    except Exception:
+        pass
+    # Fallback: a single cube, so the tool always produces something.
+    return {"objects": [{"type": "cube", "location": [0, 0, 0], "scale": [1, 1, 1]}]}
+
+
+@tool(
+    "create_3d_scene",
+    "Generate a simple 3D scene (made of cubes, spheres, and planes) from a description "
+    "and open it in Blender.",
+    parameters={"description": {"type": "string", "description": "What to build, e.g. 'a small table with four legs'"}},
+    required=["description"],
+)
+def create_3d_scene(description: str) -> str:
+    spec = _spec_from_description(description)
+    return blender_integration.open_simple_scene(spec)
+</file>
+
+<file path="assistant/agent/tools_files.py">
+"""File and folder tools. Files are located by a folder shortcut ('desktop',
+'documents', 'downloads') plus a filename, or a full path - file_ops.resolve_path
+handles both."""
+from __future__ import annotations
+
+from .. import computer, file_ops
+from .registry import tool
+
+_LOCATION_DESC = (
+    "Folder: 'desktop', 'documents', 'downloads', or a full folder path. "
+    "Defaults to desktop if omitted."
+)
+
+
+@tool(
+    "list_folder",
+    "List the files and subfolders inside a folder.",
+    parameters={"folder": {"type": "string", "description": _LOCATION_DESC}},
+)
+def list_folder(folder: str = "") -> str:
+    return computer.list_directory(folder)
+
+
+@tool(
+    "create_folder",
+    "Create a new folder/directory.",
+    parameters={"path": {"type": "string", "description": "Folder path to create"}},
+    required=["path"],
+)
+def create_folder(path: str) -> str:
+    return computer.create_folder(path)
+
+
+@tool(
+    "open_folder",
+    "Open a folder in File Explorer.",
+    parameters={"path": {"type": "string", "description": _LOCATION_DESC}},
+    required=["path"],
+)
+def open_folder(path: str) -> str:
+    return computer.open_folder(path)
+
+
+@tool(
+    "create_file",
+    "Create a new text file with content, overwriting if it already exists.",
+    parameters={
+        "location": {"type": "string", "description": _LOCATION_DESC},
+        "filename": {"type": "string", "description": "File name, e.g. 'notes.txt'"},
+        "content": {"type": "string", "description": "Text content to write"},
+    },
+    required=["filename"],
+)
+def create_file(filename: str, location: str = "desktop", content: str = "") -> str:
+    path = file_ops.resolve_path(location, filename)
+    return file_ops.create_file(path, content)
+
+
+@tool(
+    "read_file",
+    "Read and return the text contents of a file.",
+    parameters={
+        "location": {"type": "string", "description": _LOCATION_DESC},
+        "filename": {"type": "string", "description": "File name to read"},
+    },
+    required=["filename"],
+)
+def read_file(filename: str, location: str = "desktop") -> str:
+    path = file_ops.resolve_path(location, filename)
+    return file_ops.read_file(path)
+
+
+@tool(
+    "append_to_file",
+    "Append text to the end of an existing file (creates it if missing).",
+    parameters={
+        "location": {"type": "string", "description": _LOCATION_DESC},
+        "filename": {"type": "string", "description": "File name"},
+        "content": {"type": "string", "description": "Text to append"},
+    },
+    required=["filename", "content"],
+)
+def append_to_file(filename: str, content: str, location: str = "desktop") -> str:
+    path = file_ops.resolve_path(location, filename)
+    return file_ops.append_to_file(path, content)
+
+
+@tool(
+    "overwrite_file",
+    "Replace the entire contents of an existing file with new text.",
+    parameters={
+        "location": {"type": "string", "description": _LOCATION_DESC},
+        "filename": {"type": "string", "description": "File name"},
+        "content": {"type": "string", "description": "New text content"},
+    },
+    required=["filename", "content"],
+)
+def overwrite_file(filename: str, content: str, location: str = "desktop") -> str:
+    path = file_ops.resolve_path(location, filename)
+    return file_ops.write_file(path, content)
+
+
+@tool(
+    "delete_file",
+    "Permanently delete a file. Destructive and cannot be undone.",
+    parameters={
+        "location": {"type": "string", "description": _LOCATION_DESC},
+        "filename": {"type": "string", "description": "File name to delete"},
+    },
+    required=["filename"],
+    confirm=True,
+)
+def delete_file(filename: str, location: str = "desktop") -> str:
+    path = file_ops.resolve_path(location, filename)
+    return file_ops.delete_file(path)
+</file>
+
+<file path="assistant/agent/tools_memory.py">
+"""Memory tools. The planner also auto-injects relevant memory into the
+system prompt every turn (see planner.py) - these tools are how new memory
+gets written, plus an explicit recall tool for "what do you know about me"."""
+from __future__ import annotations
+
+from ..memory import store
+from .registry import tool
+
+
+@tool(
+    "remember_fact",
+    "Save a fact about the user for future conversations, e.g. their job, family, "
+    "goals, or anything else worth remembering long-term. Use short key/value pairs.",
+    parameters={
+        "key": {"type": "string", "description": "Short label for the fact, e.g. 'job' or 'hometown'"},
+        "value": {"type": "string", "description": "The fact itself"},
+    },
+    required=["key", "value"],
+)
+def remember_fact(key: str, value: str) -> str:
+    return store.remember_fact(key, value)
+
+
+@tool(
+    "forget_fact",
+    "Delete a previously remembered fact. Only use this when the user explicitly asks "
+    "to forget or delete something.",
+    parameters={"key": {"type": "string", "description": "The key of the fact to forget"}},
+    required=["key"],
+)
+def forget_fact(key: str) -> str:
+    return store.forget_fact(key)
+
+
+@tool(
+    "remember_preference",
+    "Save a preference, e.g. favorite browser, IDE, music, or website. If the user "
+    "mentions a favorite or 'always use X for Y', save it here.",
+    parameters={
+        "category": {"type": "string", "description": "What kind of preference, e.g. 'browser', 'ide', 'music'"},
+        "value": {"type": "string", "description": "The preferred thing"},
+    },
+    required=["category", "value"],
+)
+def remember_preference(category: str, value: str) -> str:
+    return store.remember_preference(category, value)
+
+
+@tool(
+    "remember_procedure",
+    "Save how the user likes a specific task done, e.g. 'when I say send it, use Outlook "
+    "not Gmail'. Use this for behavioral rules, not one-off facts.",
+    parameters={
+        "trigger": {"type": "string", "description": "The situation, e.g. 'I say send it'"},
+        "action": {"type": "string", "description": "What to do in that situation"},
+    },
+    required=["trigger", "action"],
+)
+def remember_procedure(trigger: str, action: str) -> str:
+    return store.remember_procedure(trigger, action)
+
+
+@tool(
+    "list_what_you_know",
+    "List everything currently remembered about the user - facts, preferences, and habits. "
+    "Use this when the user asks what you know or remember about them.",
+)
+def list_what_you_know() -> str:
+    return store.summarize_all()
+</file>
+
+<file path="assistant/agent/tools_productivity.py">
+"""Productivity tools: todos, notes, timers, reminders, weather, math, date/time.
+
+Timers are in-memory only (lost on restart, which is fine for a "ring in 5
+minutes" style timer). Reminders are persisted to disk via assistant.reminders.
+Both are polled by main.py's timer-check loop through check_timers_due() /
+assistant.reminders.check_due(), same as before Phase 1.
+"""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta
+
+from .. import math_helper, notes, reminders, weather
+from .registry import tool
+
+_UNIT_SECONDS = {"second": 1, "seconds": 1, "minute": 60, "minutes": 60, "hour": 3600, "hours": 3600}
+
+# id -> (end_epoch_seconds, message)
+_timers: dict[int, tuple[float, str]] = {}
+_next_timer_id = 0
+
+
+def _to_seconds(amount: int, unit: str) -> int:
+    return int(amount) * _UNIT_SECONDS.get((unit or "minutes").lower(), 60)
+
+
+def check_timers_due() -> list[str]:
+    """Called by the planner's check_timers(); not itself an LLM tool."""
+    now = time.time()
+    due, expired_ids = [], []
+    for tid, (end, msg) in _timers.items():
+        if now >= end:
+            due.append(msg)
+            expired_ids.append(tid)
+    for tid in expired_ids:
+        del _timers[tid]
+    return due
+
+
+@tool(
+    "set_timer",
+    "Set a countdown timer that will announce a message when it finishes.",
+    parameters={
+        "amount": {"type": "integer", "description": "How many units from now"},
+        "unit": {"type": "string", "enum": ["seconds", "minutes", "hours"], "description": "Time unit"},
+        "message": {"type": "string", "description": "What to announce when the timer is done"},
+    },
+    required=["amount", "unit"],
+)
+def set_timer(amount: int, unit: str = "minutes", message: str = "Timer's up.") -> str:
+    global _next_timer_id
+    seconds = _to_seconds(amount, unit)
+    _next_timer_id += 1
+    _timers[_next_timer_id] = (time.time() + seconds, message)
+    return f"Timer set for {amount} {unit}."
+
+
+@tool(
+    "set_reminder",
+    "Set a reminder that persists across restarts and will announce a message at a future time.",
+    parameters={
+        "amount": {"type": "integer", "description": "How many units from now"},
+        "unit": {"type": "string", "enum": ["seconds", "minutes", "hours"], "description": "Time unit"},
+        "message": {"type": "string", "description": "What to be reminded of"},
+    },
+    required=["amount", "unit", "message"],
+)
+def set_reminder(amount: int, unit: str, message: str) -> str:
+    seconds = _to_seconds(amount, unit)
+    when = datetime.now() + timedelta(seconds=seconds)
+    return reminders.add_reminder(when, message)
+
+
+@tool("list_reminders", "List upcoming reminders that haven't fired yet.")
+def list_reminders() -> str:
+    upcoming = reminders.list_upcoming()
+    if not upcoming:
+        return "No upcoming reminders."
+    return "\n".join(f"{when.strftime('%Y-%m-%d %H:%M')}: {msg}" for when, msg in upcoming)
+
+
+@tool(
+    "add_todo",
+    "Add an item to the to-do list.",
+    parameters={"item": {"type": "string", "description": "Item to add"}},
+    required=["item"],
+)
+def add_todo(item: str) -> str:
+    return notes.add_todo(item)
+
+
+@tool("list_todos", "List everything currently on the to-do list.")
+def list_todos() -> str:
+    items = notes.get_todos()
+    if not items:
+        return "The to-do list is empty."
+    return "\n".join(f"{i+1}. {t}" for i, t in enumerate(items))
+
+
+@tool("clear_todos", "Remove everything from the to-do list.", confirm=True)
+def clear_todos() -> str:
+    return notes.clear_todos()
+
+
+@tool(
+    "add_note",
+    "Save a free-form note for later.",
+    parameters={"note": {"type": "string", "description": "Note text"}},
+    required=["note"],
+)
+def add_note(note: str) -> str:
+    return notes.add_note(note)
+
+
+@tool("list_notes", "List saved notes.")
+def list_notes() -> str:
+    return notes.list_notes_summary()
+
+
+@tool(
+    "get_weather",
+    "Get the current weather for a city or zip code.",
+    parameters={"city_or_zip": {"type": "string", "description": "City name or zip code. Omit for the default location."}},
+)
+def get_weather(city_or_zip: str = "") -> str:
+    return weather.get_weather(city_or_zip or None)
+
+
+@tool(
+    "calculate",
+    "Evaluate a math expression and return the result.",
+    parameters={"expression": {"type": "string", "description": "Math expression, e.g. '12 * (4 + 3)'"}},
+    required=["expression"],
+)
+def calculate(expression: str) -> str:
+    result = math_helper.safe_calculate(expression)
+    if result is None:
+        return f"Could not evaluate: {expression}"
+    return str(result)
+
+
+@tool("get_current_datetime", "Get the current date and time.")
+def get_current_datetime() -> str:
+    return datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+</file>
+
+<file path="assistant/agent/tools_system.py">
+"""Desktop control tools: apps, keyboard, mouse, clipboard, volume, screenshots."""
+from __future__ import annotations
+
+from .. import audio_devices, computer
+from .registry import tool
+
+
+@tool(
+    "open_app",
+    "Launch a desktop application by name, e.g. 'notepad', 'chrome', 'spotify'.",
+    parameters={"name": {"type": "string", "description": "Application name or path"}},
+    required=["name"],
+)
+def open_app(name: str) -> str:
+    return computer.open_app(name)
+
+
+@tool(
+    "type_text",
+    "Type text at the current cursor/focus location, as if typed on the keyboard.",
+    parameters={"text": {"type": "string", "description": "Text to type"}},
+    required=["text"],
+)
+def type_text(text: str) -> str:
+    return computer.type_text(text)
+
+
+@tool(
+    "press_key",
+    "Press a single keyboard key or shortcut, e.g. 'enter', 'escape', 'ctrl+c', 'alt+tab'.",
+    parameters={"key_name": {"type": "string", "description": "Key or shortcut name"}},
+    required=["key_name"],
+)
+def press_key(key_name: str) -> str:
+    return computer.press_key(key_name)
+
+
+@tool(
+    "mouse_move",
+    "Move the mouse cursor to absolute screen coordinates, or by a relative offset.",
+    parameters={
+        "x": {"type": "integer", "description": "Target X coordinate"},
+        "y": {"type": "integer", "description": "Target Y coordinate"},
+        "relative": {"type": "boolean", "description": "If true, x/y are offsets from current position"},
+    },
+    required=["x", "y"],
+)
+def mouse_move(x: int, y: int, relative: bool = False) -> str:
+    return computer.mouse_move(x=x, y=y, relative=relative)
+
+
+@tool(
+    "mouse_click",
+    "Click the mouse at its current position.",
+    parameters={
+        "button": {"type": "string", "description": "'left', 'right', or 'middle'", "enum": ["left", "right", "middle"]},
+        "clicks": {"type": "integer", "description": "Number of clicks (2 for double-click)"},
+    },
+)
+def mouse_click(button: str = "left", clicks: int = 1) -> str:
+    return computer.mouse_click(button=button, clicks=clicks)
+
+
+@tool(
+    "click_on_screen",
+    "Find something on screen by visual description (e.g. 'the Save button', 'the search box') "
+    "and click it. Uses a screenshot + vision model to locate it. Slower than mouse_click - only "
+    "use this when you don't already know exact coordinates.",
+    parameters={"target": {"type": "string", "description": "Visual description of what to click"}},
+    required=["target"],
+)
+def click_on_screen(target: str) -> str:
+    return computer.click_on_screen(target)
+
+
+@tool(
+    "mouse_scroll",
+    "Scroll the mouse wheel up or down.",
+    parameters={"delta": {"type": "integer", "description": "Positive scrolls up, negative scrolls down"}},
+    required=["delta"],
+)
+def mouse_scroll(delta: int) -> str:
+    return computer.mouse_scroll(delta)
+
+
+@tool(
+    "take_screenshot",
+    "Capture a screenshot of the screen and save it to disk.",
+    parameters={"save_path": {"type": "string", "description": "Optional file path to save to"}},
+)
+def take_screenshot(save_path: str = "") -> str:
+    return computer.take_screenshot(save_path or None)
+
+
+@tool("get_system_info", "Get CPU, memory, and disk usage stats for this PC.")
+def get_system_info() -> str:
+    return computer.get_system_info()
+
+
+@tool("get_clipboard", "Read the current text on the clipboard.")
+def get_clipboard() -> str:
+    return computer.get_clipboard()
+
+
+@tool(
+    "set_clipboard",
+    "Copy text to the clipboard.",
+    parameters={"text": {"type": "string", "description": "Text to copy"}},
+    required=["text"],
+)
+def set_clipboard(text: str) -> str:
+    return computer.set_clipboard(text)
+
+
+@tool(
+    "lock_pc",
+    "Lock the computer immediately, ending this session until the user logs back in.",
+    confirm=True,
+)
+def lock_pc() -> str:
+    return computer.lock_pc()
+
+
+@tool(
+    "adjust_volume",
+    "Change the system volume: turn it up, down, mute it, or set an exact percentage.",
+    parameters={
+        "action": {"type": "string", "enum": ["up", "down", "mute", "set"], "description": "Which volume action"},
+        "percent": {"type": "integer", "description": "Target percent (0-100), only used when action is 'set'"},
+    },
+    required=["action"],
+)
+def adjust_volume(action: str, percent: int = 50) -> str:
+    action = (action or "").lower()
+    if action == "up":
+        return computer.volume_up()
+    if action == "down":
+        return computer.volume_down()
+    if action == "mute":
+        return computer.volume_mute()
+    if action == "set":
+        return computer.set_volume_percent(percent)
+    return f"Unknown volume action: {action}"
+
+
+@tool("list_microphones", "List available microphone input devices and their index numbers.")
+def list_microphones() -> str:
+    devices = audio_devices.list_input_devices()
+    if not devices:
+        return "No microphones found."
+    return "\n".join(f"[{idx}] {name}" for idx, name in devices)
+</file>
+
+<file path="assistant/agent/tools_vision.py">
+"""Vision tools: camera and screen understanding via the local vision model."""
+from __future__ import annotations
+
+from .. import vision
+from .registry import tool
+
+
+@tool(
+    "look_at_camera",
+    "Look through the webcam and describe what's visible, or answer a specific question "
+    "about what the camera sees.",
+    parameters={"question": {"type": "string", "description": "Optional specific question about the camera view"}},
+)
+def look_at_camera(question: str = "") -> str:
+    return vision.what_do_you_see(question=question or None)
+
+
+@tool(
+    "look_at_screen",
+    "Take a screenshot and describe what's on screen, or answer a specific question about it.",
+    parameters={"question": {"type": "string", "description": "Optional specific question about the screen"}},
+)
+def look_at_screen(question: str = "") -> str:
+    return vision.describe_screen(question=question or None)
+
+
+@tool("count_fingers", "Look at the webcam and count how many fingers are held up.")
+def count_fingers() -> str:
+    result = vision.describe_hand_gesture()
+    return result
+</file>
+
+<file path="assistant/agent/tools_web.py">
+"""Web search and browser tools. Browser control opens the user's default
+browser/search engine rather than hardcoding one (Playwright-based DOM control
+lands in Phase 4 - for now this drives the OS-level browser)."""
+from __future__ import annotations
+
+from .. import computer, web_search
+from .registry import tool
+
+
+@tool(
+    "web_search",
+    "Search the web and get a summary of the top results. Use this to answer questions "
+    "about current events, facts, or anything you're not sure about.",
+    parameters={"query": {"type": "string", "description": "Search query"}},
+    required=["query"],
+)
+def search(query: str) -> str:
+    return web_search.search_summary(query)
+
+
+@tool(
+    "open_browser_search",
+    "Open the default web browser and perform a search for a query.",
+    parameters={"query": {"type": "string", "description": "What to search for"}},
+    required=["query"],
+)
+def open_browser_search(query: str) -> str:
+    return computer.open_browser_search(query)
+
+
+@tool(
+    "open_website",
+    "Open a specific URL or website in the default browser.",
+    parameters={"url": {"type": "string", "description": "URL or site name, e.g. 'https://github.com' or 'github'"}},
+    required=["url"],
+)
+def open_website(url: str) -> str:
+    return computer.open_browser_url(url)
+
+
+@tool(
+    "search_within_site",
+    "Open a specific website and search within it, e.g. search 'wireless mouse' on 'amazon'.",
+    parameters={
+        "site": {"type": "string", "description": "Site name, e.g. 'amazon', 'youtube', 'wikipedia'"},
+        "query": {"type": "string", "description": "What to search for on that site"},
+    },
+    required=["site", "query"],
+)
+def search_within_site(site: str, query: str) -> str:
+    return computer.open_site_search(site, query)
+
+
+@tool(
+    "play_youtube_video",
+    "Search YouTube for a query and start playing the first result.",
+    parameters={"query": {"type": "string", "description": "What to search for on YouTube"}},
+    required=["query"],
+)
+def play_youtube_video(query: str) -> str:
+    return computer.open_first_youtube_video(query)
+
+
+@tool(
+    "search_and_add_to_cart",
+    "Search for a product on a shopping site and add the first result to the cart. "
+    "This is a purchase-adjacent action - always confirm with the user first.",
+    parameters={
+        "site": {"type": "string", "description": "Shopping site, e.g. 'amazon'"},
+        "query": {"type": "string", "description": "Product to search for"},
+    },
+    required=["site", "query"],
+    confirm=True,
+)
+def search_and_add_to_cart(site: str, query: str) -> str:
+    return computer.search_site_and_add_first_to_cart(site, query)
+</file>
+
+<file path="assistant/memory/__init__.py">
+"""
+Persistent memory (Phase 2): semantic facts, preferences, procedural rules,
+and an episodic event log, stored in a local SQLite file (jarvis_memory.db).
+See store.py for the actual read/write functions and db.py for the schema.
+"""
+from . import store  # noqa: F401
+</file>
+
+<file path="assistant/memory/db.py">
+"""SQLite connection + schema for Jarvis's persistent memory.
+
+One local file, no external services - stays consistent with the
+local-first/free-only requirement. Lives next to jarvis_settings.json,
+in DATA_DIR if set, otherwise the project root.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+
+import config
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS semantic_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    value TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS preferences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL UNIQUE,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS procedural_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger TEXT NOT NULL,
+    action TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS episodic_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def _data_dir() -> str:
+    base = (getattr(config, "DATA_DIR", "") or "").strip()
+    if base:
+        return os.path.normpath(base)
+    # This file lives at <project_root>/assistant/memory/db.py, so the
+    # project root is three directories up from here. (A previous version
+    # only went up two, which put jarvis_memory.db inside assistant/ instead
+    # of the project root - harmless functionally, but inconsistent with
+    # where the README says it lives.)
+    here = os.path.dirname(os.path.abspath(__file__))          # .../assistant/memory
+    assistant_dir = os.path.dirname(here)                       # .../assistant
+    return os.path.dirname(assistant_dir)                       # project root
+
+
+def _db_path() -> str:
+    return os.path.join(_data_dir(), "jarvis_memory.db")
+
+
+def _migrate_from_old_location(correct_path: str) -> None:
+    """One-time fix-up: earlier versions of this file had an off-by-one path
+    bug that put jarvis_memory.db inside assistant/ instead of the project
+    root. If that's where an existing database is, and nothing exists yet at
+    the correct location, move it rather than silently starting over with an
+    empty one."""
+    if os.path.exists(correct_path):
+        return
+    here = os.path.dirname(os.path.abspath(__file__))  # .../assistant/memory
+    old_path = os.path.join(os.path.dirname(here), "jarvis_memory.db")  # .../assistant
+    if os.path.exists(old_path):
+        try:
+            os.replace(old_path, correct_path)
+        except Exception:
+            pass  # not worth failing startup over; worst case, a fresh DB is created
+
+
+def get_connection() -> sqlite3.Connection:
+    os.makedirs(_data_dir(), exist_ok=True)
+    db_path = _db_path()
+    _migrate_from_old_location(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    return conn
+</file>
+
+<file path="assistant/memory/store.py">
+"""
+CRUD and retrieval for Jarvis's memory. Four memory types, matching the
+original spec:
+
+  semantic_facts    - facts about the user ("works as a electrician")
+  preferences        - favorite software/browser/IDE/music/etc, keyed by category
+  procedural_rules   - how the user likes tasks done ("when I say X, do Y")
+  episodic_events     - a running log of what happened, for "what did we do" recall
+
+Retrieval is plain keyword overlap + recency, not embeddings - deliberately,
+to avoid pulling in a heavier dependency for Phase 2. Embedding-based
+semantic search can replace this later without changing the tool/planner
+contract, since everything routes through build_context_block().
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from . import db
+
+_MAX_EPISODIC_EVENTS = 500  # oldest events get pruned past this
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "or",
+    "in", "on", "at", "for", "with", "my", "me", "i", "you", "your", "it",
+    "that", "this", "do", "does", "did", "can", "could", "please", "what",
+    "when", "how", "should", "would", "will", "want", "need",
+}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _words(text: str) -> set:
+    tokens = re.findall(r"[a-z0-9']+", (text or "").lower())
+    return {t for t in tokens if t not in _STOPWORDS and len(t) > 1}
+
+
+# --------------------------------------------------------------------------
+# Semantic facts
+# --------------------------------------------------------------------------
+
+def remember_fact(key: str, value: str, confidence: float = 1.0) -> str:
+    key = key.strip()
+    value = value.strip()
+    now = _now()
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO semantic_facts (key, value, confidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                confidence = excluded.confidence,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, confidence, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return f"Remembered: {key} = {value}"
+
+
+def forget_fact(key: str) -> str:
+    conn = db.get_connection()
+    try:
+        cur = conn.execute("DELETE FROM semantic_facts WHERE key = ?", (key.strip(),))
+        conn.commit()
+        return f"Forgot '{key}'." if cur.rowcount else f"Didn't have anything stored for '{key}'."
+    finally:
+        conn.close()
+
+
+def get_relevant_facts(query: str, limit: int = 6) -> List[str]:
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM semantic_facts ORDER BY updated_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    query_words = _words(query)
+    scored = []
+    for row in rows:
+        text_words = _words(f"{row['key']} {row['value']}")
+        score = len(query_words & text_words)
+        scored.append((score, row["key"], row["value"]))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = [t for t in scored if t[0] > 0][:limit]
+    if not top:
+        top = scored[:min(3, limit)]  # no keyword match - fall back to most recent
+    return [f"{k}: {v}" for _, k, v in top]
+
+
+# --------------------------------------------------------------------------
+# Preferences
+# --------------------------------------------------------------------------
+
+def remember_preference(category: str, value: str) -> str:
+    category = category.strip().lower()
+    value = value.strip()
+    now = _now()
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO preferences (category, value, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(category) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (category, value, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return f"Got it - preferred {category}: {value}"
+
+
+def get_preference(category: str) -> Optional[str]:
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM preferences WHERE category = ?", (category.strip().lower(),)
+        ).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def get_all_preferences() -> Dict[str, str]:
+    conn = db.get_connection()
+    try:
+        rows = conn.execute("SELECT category, value FROM preferences ORDER BY category").fetchall()
+        return {row["category"]: row["value"] for row in rows}
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Procedural rules
+# --------------------------------------------------------------------------
+
+def remember_procedure(trigger: str, action: str) -> str:
+    now = _now()
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO procedural_rules (trigger, action, created_at) VALUES (?, ?, ?)",
+            (trigger.strip(), action.strip(), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return f"Noted - when {trigger}, {action}."
+
+
+def get_relevant_procedures(query: str, limit: int = 4) -> List[str]:
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT trigger, action FROM procedural_rules ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    query_words = _words(query)
+    scored = []
+    for row in rows:
+        text_words = _words(f"{row['trigger']} {row['action']}")
+        score = len(query_words & text_words)
+        scored.append((score, row["trigger"], row["action"]))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = [t for t in scored if t[0] > 0][:limit]
+    return [f"When {trig}: {act}" for _, trig, act in top]
+
+
+# --------------------------------------------------------------------------
+# Episodic events
+# --------------------------------------------------------------------------
+
+def log_episodic(summary: str) -> None:
+    now = _now()
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO episodic_events (summary, created_at) VALUES (?, ?)",
+            (summary.strip()[:500], now),
+        )
+        # Prune old events past the cap so this table never grows unbounded.
+        conn.execute(
+            """
+            DELETE FROM episodic_events WHERE id NOT IN (
+                SELECT id FROM episodic_events ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (_MAX_EPISODIC_EVENTS,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_recent_episodic(limit: int = 4) -> List[str]:
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT summary FROM episodic_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [row["summary"] for row in rows]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Context building for the planner, and a human-readable dump for the user
+# --------------------------------------------------------------------------
+
+def build_context_block(user_message: str) -> str:
+    """Returns a system-prompt-ready block of the memory most relevant to
+    this turn. Empty string if there's nothing stored yet."""
+    facts = get_relevant_facts(user_message, limit=6)
+    prefs = get_all_preferences()
+    procs = get_relevant_procedures(user_message, limit=4)
+    recent = get_recent_episodic(limit=4)
+
+    sections = []
+    if facts:
+        sections.append("Known facts about the user:\n" + "\n".join(f"- {f}" for f in facts))
+    if prefs:
+        pref_lines = "\n".join(f"- {cat}: {val}" for cat, val in prefs.items())
+        sections.append("Stated preferences:\n" + pref_lines)
+    if procs:
+        sections.append("How the user likes certain things done:\n" + "\n".join(f"- {p}" for p in procs))
+    if recent:
+        sections.append("Recently:\n" + "\n".join(f"- {r}" for r in recent))
+
+    if not sections:
+        return ""
+    return "What you remember about the user:\n\n" + "\n\n".join(sections)
+
+
+def summarize_all() -> str:
+    """Human-readable dump of everything stored - what the list_what_you_know
+    tool returns when the user asks "what do you know about me"."""
+    conn = db.get_connection()
+    try:
+        facts = conn.execute("SELECT key, value FROM semantic_facts ORDER BY updated_at DESC").fetchall()
+        procs = conn.execute("SELECT trigger, action FROM procedural_rules ORDER BY created_at DESC").fetchall()
+    finally:
+        conn.close()
+    prefs = get_all_preferences()
+
+    lines = []
+    if facts:
+        lines.append("Facts:")
+        lines.extend(f"  - {r['key']}: {r['value']}" for r in facts)
+    if prefs:
+        lines.append("Preferences:")
+        lines.extend(f"  - {cat}: {val}" for cat, val in prefs.items())
+    if procs:
+        lines.append("Habits/rules:")
+        lines.extend(f"  - When {r['trigger']}: {r['action']}" for r in procs)
+    if not lines:
+        return "I don't have anything stored yet."
+    return "\n".join(lines)
+</file>
+
+<file path="assistant/__init__.py">
+# Jarvis-like Local Assistant - Core package
+</file>
+
+<file path="assistant/audio_devices.py">
+"""Audio device helpers (PyAudio input devices).
+
+Windows exposes almost every physical microphone multiple times - once per
+audio host API (MME, DirectSound, WASAPI, WDM-KS) - which is why a naive
+device listing can show 8-12 near-identical entries for what's really 2-3
+physical mics. This narrows that down to one clean entry per physical
+device, using WASAPI (the modern, low-latency Windows API where each device
+appears exactly once) as the canonical source.
+
+This also provides open_input_stream(), a shared helper used by both
+wake_word.py and stt.py to actually open a recording stream. Some devices
+(webcams, cheap USB mics) only support their own native sample rate and
+reject others outright - PyAudio/PortAudio raises "Invalid sample rate"
+rather than silently adapting. Earlier versions of this file tried to
+*predict* that in advance with pa.is_format_supported(), but that call
+turned out to be unreliable in both directions (both false positives and
+false negatives were observed against real hardware). It's more robust to
+just try opening at the preferred rate and fall back to the device's native
+rate on failure - see open_input_stream().
+"""
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+_TARGET_RATE = 16000  # what wake_word and Whisper both want
+
+
+def list_input_devices() -> List[Tuple[int, str]]:
+    """
+    Return (device_index, device_name) for input devices that are real (not
+    a duplicate host-API entry for the same physical mic). The system
+    default device, if present, is labeled "(default)" and sorted first.
+    """
+    try:
+        import pyaudio
+    except Exception:
+        return []
+
+    pa = None
+    try:
+        pa = pyaudio.PyAudio()
+
+        # Find WASAPI - each physical device appears exactly once under it,
+        # unlike the legacy MME/DirectSound APIs which each re-list every
+        # device separately.
+        wasapi_index = None
+        for i in range(pa.get_host_api_count()):
+            try:
+                api_info = pa.get_host_api_info_by_index(i)
+                if "wasapi" in str(api_info.get("name", "")).lower():
+                    wasapi_index = i
+                    break
+            except Exception:
+                continue
+
+        default_name = ""
+        try:
+            default_name = str(pa.get_default_input_device_info().get("name", "")).strip().lower()
+        except Exception:
+            pass
+
+        def _gather(require_wasapi: bool) -> list:
+            found = []
+            for i in range(pa.get_device_count()):
+                try:
+                    info = pa.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                if info.get("maxInputChannels", 0) <= 0:
+                    continue
+                if require_wasapi and info.get("hostApi") != wasapi_index:
+                    continue
+                found.append(info)
+            return found
+
+        candidates = _gather(require_wasapi=True) if wasapi_index is not None else []
+        if not candidates:
+            # WASAPI unavailable - fall back to everything, deduped by name,
+            # rather than showing nothing or a huge duplicated list.
+            seen_names = set()
+            for info in _gather(require_wasapi=False):
+                name = str(info.get("name", ""))
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                candidates.append(info)
+
+        out: List[Tuple[int, str]] = []
+        default_entry = None
+        for info in candidates:
+            idx = int(info["index"])
+            name = str(info.get("name", "")).strip()
+            is_default = name.lower() == default_name
+            label = f"{name} (default)" if is_default else name
+            entry = (idx, label)
+            if is_default:
+                default_entry = entry
+            else:
+                out.append(entry)
+
+        if default_entry:
+            out.insert(0, default_entry)
+
+        return out
+    finally:
+        try:
+            if pa:
+                pa.terminate()
+        except Exception:
+            pass
+
+
+def open_input_stream(
+    pa,
+    device_index: Optional[int],
+    preferred_rate: int = _TARGET_RATE,
+    channels: int = 1,
+    frames_per_buffer: int = 1024,
+):
+    """
+    Open a PyAudio input stream, preferring `preferred_rate` but falling
+    back to the device's own native rate if it rejects that (common with
+    webcam/USB mics, which often only support 44100/48000 and raise
+    "Invalid sample rate" for anything else).
+
+    Returns (stream, actual_rate) - callers that need audio at a specific
+    rate (like wake_word's 16kHz model) must resample if actual_rate !=
+    preferred_rate; callers that just need *a* usable recording (like
+    stt.record_from_microphone, which resamples after the fact anyway) can
+    use actual_rate directly.
+    """
+    import pyaudio
+
+    try:
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=preferred_rate,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=frames_per_buffer,
+        )
+        return stream, preferred_rate
+    except Exception:
+        pass
+
+    try:
+        info = (
+            pa.get_device_info_by_index(device_index)
+            if device_index is not None
+            else pa.get_default_input_device_info()
+        )
+        native_rate = int(info.get("defaultSampleRate", 44100) or 44100)
+    except Exception:
+        native_rate = 44100
+
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=channels,
+        rate=native_rate,
+        input=True,
+        input_device_index=device_index,
+        frames_per_buffer=frames_per_buffer,
+    )
+    return stream, native_rate
+</file>
+
+<file path="assistant/blender_integration.py">
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+from typing import Any, Dict
+
+import config
+
+
+def _blender_executable() -> str:
+    """
+    Resolve Blender executable path from config or PATH.
+    """
+    path = getattr(config, "BLENDER_PATH", "") or ""
+    if path and os.path.isfile(path):
+        return path
+    return "blender"
+
+
+def open_simple_scene(spec: Dict[str, Any]) -> str:
+    """
+    Create a simple 3D scene in Blender based on a structured spec and open it.
+
+    Spec example:
+    {
+      "objects": [
+        {"type": "cube", "location": [0,0,0], "scale": [1,1,1]},
+        {"type": "sphere", "location": [2,0,0], "scale": [0.5,0.5,0.5]}
+      ]
+    }
+    """
+    try:
+        exe = _blender_executable()
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as script:
+            script_path = script.name
+            script.write("import bpy\n")
+            script.write("import json\n")
+            script.write("spec = json.loads(r'''")
+            script.write(json.dumps(spec))
+            script.write("''')\n")
+            script.write(
+                "for obj in list(bpy.data.objects):\n"
+                "    if obj.type in {'MESH','LIGHT','CAMERA'}:\n"
+                "        bpy.data.objects.remove(obj, do_unlink=True)\n"
+            )
+            script.write(
+                "for desc in spec.get('objects', []):\n"
+                "    t = (desc.get('type') or 'cube').lower()\n"
+                "    loc = desc.get('location', [0,0,0])\n"
+                "    sc = desc.get('scale', [1,1,1])\n"
+                "    if t == 'cube':\n"
+                "        bpy.ops.mesh.primitive_cube_add(location=loc)\n"
+                "    elif t in ('sphere','uv_sphere'):\n"
+                "        bpy.ops.mesh.primitive_uv_sphere_add(location=loc)\n"
+                "    elif t == 'plane':\n"
+                "        bpy.ops.mesh.primitive_plane_add(location=loc)\n"
+                "    else:\n"
+                "        bpy.ops.mesh.primitive_cube_add(location=loc)\n"
+                "    obj = bpy.context.active_object\n"
+                "    obj.scale = sc\n"
+            )
+        subprocess.Popen([exe, "--python", script_path], shell=False)
+        return "Opening a generated 3D scene in Blender."
+    except Exception as e:
+        return f"Could not open Blender scene: {e}"
+</file>
+
+<file path="assistant/brain.py">
+"""
+Compatibility shim (Phase 1).
+
+The old brain.py was a 1,100-line cascade of regex intent-matchers. That logic
+has been replaced by assistant/agent/ - a tool-calling planner that lets the
+LLM decide which capability to invoke instead of hand-matching phrasing.
+
+This file only exists so main.py's `from assistant import brain` / `brain.process(...)`
+calls keep working unchanged. All real logic now lives in assistant/agent/.
+"""
+from __future__ import annotations
+
+from . import reminders
+from .agent import planner
+
+
+def process(user_message: str) -> str:
+    return planner.process(user_message)
+
+
+def check_timers() -> list[str]:
+    from .agent import tools_productivity
+    return tools_productivity.check_timers_due()
+
+
+def check_reminders() -> list[str]:
+    try:
+        return reminders.check_due()
+    except Exception:
+        return []
+</file>
+
+<file path="assistant/computer.py">
+"""Computer control: open apps, type text, mouse, keyboard, navigation."""
+from __future__ import annotations
+
+import io
+import os
+import subprocess
+import urllib.parse
+from typing import Optional, Tuple
+
+import pyautogui
+from pynput.keyboard import Controller as KeyController, Key
+from pynput.mouse import Controller as MouseController
+
+# Prevent pyautogui from failing on multi-monitor or when mouse leaves screen
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.05
+
+_keyboard = KeyController()
+_mouse = MouseController()
+
+# Common app names -> commands/paths (Windows). Add aliases so "open google" works.
+COMMON_APPS = {
+    "notepad": ["notepad.exe"],
+    "calculator": ["calc.exe"],
+    "calc": ["calc.exe"],
+    "paint": ["mspaint.exe"],
+    "explorer": ["explorer.exe"],
+    "file explorer": ["explorer.exe"],
+    "cmd": ["cmd.exe"],
+    "command prompt": ["cmd.exe"],
+    "powershell": ["powershell.exe"],
+    "browser": ["start", "msedge.exe"],
+    "chrome": ["start", "chrome.exe"],
+    "google": ["start", "chrome.exe"],
+    "google chrome": ["start", "chrome.exe"],
+    "edge": ["start", "msedge.exe"],
+    "microsoft edge": ["start", "msedge.exe"],
+    "firefox": ["start", "firefox.exe"],
+    "spotify": ["spotify.exe"],
+    "discord": ["discord.exe"],
+    "vscode": ["code"],
+    "vs code": ["code"],
+    "cursor": ["cursor"],
+    "settings": ["start", "ms-settings:"],
+    "task manager": ["taskmgr.exe"],
+    "word": ["start", "winword.exe"],
+    "excel": ["start", "excel.exe"],
+    "outlook": ["start", "outlook.exe"],
+}
+
+
+def _start_menu_dirs() -> list[str]:
+    """Return Start Menu program folders (all users + current user) on Windows."""
+    dirs = []
+    try:
+        all_users = os.environ.get("ProgramData", "C:\\ProgramData")
+        sm = os.path.join(all_users, "Microsoft", "Windows", "Start Menu", "Programs")
+        if os.path.isdir(sm):
+            dirs.append(sm)
+        user_profile = os.environ.get("APPDATA", "")
+        if user_profile:
+            user_sm = os.path.join(user_profile, "..", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs")
+            user_sm = os.path.normpath(user_sm)
+            if os.path.isdir(user_sm):
+                dirs.append(user_sm)
+    except Exception:
+        pass
+    return dirs
+
+
+def _find_app_in_start_menu(query: str) -> Optional[str]:
+    """
+    Search Start Menu shortcuts for an app whose name contains the query.
+    Returns path to the .lnk file to launch, or None.
+    """
+    query_lower = query.strip().lower()
+    if not query_lower:
+        return None
+    candidates: list[tuple[str, str]] = []  # (display_name_lower, full_path)
+    for start_dir in _start_menu_dirs():
+        try:
+            for root, _dirs, files in os.walk(start_dir):
+                for f in files:
+                    if not f.lower().endswith(".lnk"):
+                        continue
+                    base = os.path.splitext(f)[0]
+                    path = os.path.join(root, f)
+                    if query_lower in base.lower():
+                        candidates.append((base.lower(), path))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    # Prefer shortest name (e.g. "Google Chrome" over "Google Chrome (default)")
+    candidates.sort(key=lambda x: (len(x[0]), x[0]))
+    return candidates[0][1]
+
+
+# Site names -> URLs for "open google and go to youtube"
+COMMON_SITES = {
+    "youtube": "https://www.youtube.com",
+    "facebook": "https://www.facebook.com",
+    "twitter": "https://twitter.com",
+    "x": "https://x.com",
+    "instagram": "https://www.instagram.com",
+    "reddit": "https://www.reddit.com",
+    "amazon": "https://www.amazon.com",
+    "walmart": "https://www.walmart.com",
+    "target": "https://www.target.com",
+    "bestbuy": "https://www.bestbuy.com",
+    "ebay": "https://www.ebay.com",
+    "netflix": "https://www.netflix.com",
+    "twitch": "https://www.twitch.tv",
+    "github": "https://github.com",
+    "gmail": "https://mail.google.com",
+    "google mail": "https://mail.google.com",
+    "maps": "https://www.google.com/maps",
+    "google maps": "https://www.google.com/maps",
+    "drive": "https://drive.google.com",
+    "google drive": "https://drive.google.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "wiki": "https://www.wikipedia.org",
+}
+
+# Search URL patterns for "open [site] and search for [query]". {query} is replaced with URL-encoded query.
+SITE_SEARCH_URLS = {
+    "youtube": "https://www.youtube.com/results?search_query={query}",
+    "reddit": "https://www.reddit.com/search/?q={query}",
+    "amazon": "https://www.amazon.com/s?k={query}",
+    "walmart": "https://www.walmart.com/search?q={query}",
+    "target": "https://www.target.com/s?searchTerm={query}",
+    "bestbuy": "https://www.bestbuy.com/site/searchpage.jsp?st={query}",
+    "ebay": "https://www.ebay.com/sch/i.html?_nkw={query}",
+    "costco": "https://www.costco.com/CatalogSearch?keyword={query}",
+    "homedepot": "https://www.homedepot.com/s/{query}",
+    "lowes": "https://www.lowes.com/search?searchTerm={query}",
+    "wikipedia": "https://en.wikipedia.org/w/index.php?search={query}",
+    "wiki": "https://en.wikipedia.org/w/index.php?search={query}",
+    "github": "https://github.com/search?q={query}",
+    "twitch": "https://www.twitch.tv/search?term={query}",
+    "twitter": "https://twitter.com/search?q={query}",
+    "x": "https://x.com/search?q={query}",
+    "facebook": "https://www.facebook.com/search/top?q={query}",
+    "instagram": "https://www.instagram.com/explore/tags/{query}/",
+    "imdb": "https://www.imdb.com/find?q={query}",
+    "duckduckgo": "https://duckduckgo.com/?q={query}",
+    "bing": "https://www.bing.com/search?q={query}",
+}
+
+
+def _site_to_url(site: str) -> str:
+    """Turn a site name (e.g. 'youtube') into a full URL."""
+    s = site.strip().lower().replace(" ", "")
+    if s in COMMON_SITES:
+        return COMMON_SITES[s]
+    # If it already looks like a URL, return as-is (with scheme if missing)
+    if s.startswith("http://") or s.startswith("https://"):
+        return site.strip()
+    if "." in s:
+        return s if s.startswith("http") else "https://" + s
+    return "https://www." + s + ".com"
+
+
+def _site_search_url(site: str, query: str) -> str:
+    """Get search URL for a site. Uses known patterns or generic fallback."""
+    s = site.strip().lower().replace(" ", "")
+    encoded = urllib.parse.quote_plus(query.strip())
+    if s in SITE_SEARCH_URLS:
+        tpl = SITE_SEARCH_URLS[s]
+        for placeholder in ("{query}", "{searchTerm}", "{keyword}", "{st}"):
+            tpl = tpl.replace(placeholder, encoded)
+        return tpl
+    base = COMMON_SITES.get(s, f"https://www.{s}.com")
+    base = base.rstrip("/")
+    if "?" in base:
+        return base + "&q=" + encoded
+    return base + "/search?q=" + encoded
+
+
+def open_browser_url(url: str) -> str:
+    """Open the default browser to a URL (e.g. https://youtube.com)."""
+    url = url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    try:
+        subprocess.Popen(f"start {url}", shell=True)
+        return f"Opened {url} in your browser."
+    except Exception as e:
+        return f"Could not open browser: {e}"
+
+
+def open_browser_search(query: str) -> str:
+    """Open the default browser to Google search for the given query."""
+    if not query or not query.strip():
+        return "No search query given."
+    encoded = urllib.parse.quote_plus(query.strip())
+    url = "https://www.google.com/search?q=" + encoded
+    try:
+        subprocess.Popen(f"start {url}", shell=True)
+        return f"Opened Google search for: {query}."
+    except Exception as e:
+        return f"Could not open browser: {e}"
+
+
+def open_first_youtube_video(query: str) -> str:
+    """Search for query and open the first YouTube video result in the browser."""
+    try:
+        from . import web_search
+        results = web_search.search(f"{query.strip()} youtube", max_results=8)
+        for r in results:
+            url = (r.get("url") or "").strip()
+            if "youtube.com/watch" in url or "youtu.be/" in url:
+                return open_browser_url(url)
+        return f"No YouTube video found for: {query}"
+    except Exception as e:
+        return f"Could not find YouTube video: {e}"
+
+
+def search_site_and_add_first_to_cart(site: str, query: str, wait_seconds: Optional[float] = None) -> str:
+    """Open site, search for query, wait for load, then click Add to Cart on first result."""
+    import time
+    import config
+    wait_seconds = wait_seconds if wait_seconds is not None else getattr(config, "PAGE_LOAD_WAIT_SECONDS", 4.0)
+    url = _site_search_url(site, query)
+    try:
+        subprocess.Popen(f"start {url}", shell=True)
+    except Exception as e:
+        return f"Could not open browser: {e}"
+    time.sleep(wait_seconds)
+    from . import vision
+    png = screenshot_bytes(all_monitors=True)
+    if not png:
+        return f"Opened {site} search for {query}. Could not capture screen to add to cart."
+    target = "the Add to Cart, Add to basket, or Buy button for the FIRST product in the search results"
+    result = vision.locate_in_screenshot(png, target)
+    if result is None:
+        return f"Opened {site} and searched for {query}. Could not find Add to Cart for first result."
+    if isinstance(result, tuple):
+        x, y = result
+        sx, sy = _screen_coords_from_image(x, y)
+        pyautogui.click(sx, sy)
+        return f"Opened {site}, searched for {query}, clicked Add to Cart on first result."
+    click_screen_region(result)
+    return f"Opened {site}, searched for {query}, clicked Add to Cart region."
+
+
+def open_site_search(site: str, query: str) -> str:
+    """Open the browser to search for 'query' on the given site (e.g. youtube, reddit, amazon)."""
+    if not query or not query.strip():
+        return "No search query given."
+    site_key = site.strip().lower().replace(" ", "")
+    encoded = urllib.parse.quote_plus(query.strip())
+    if site_key in SITE_SEARCH_URLS:
+        url = SITE_SEARCH_URLS[site_key].format(query=encoded)
+    else:
+        # Fallback: try site homepage + /search?q= or common pattern
+        base = COMMON_SITES.get(site_key, f"https://www.{site_key}.com")
+        if "?" in base:
+            url = base + "&q=" + encoded
+        else:
+            url = base.rstrip("/") + "/search?q=" + encoded
+    try:
+        subprocess.Popen(f"start {url}", shell=True)
+        return f"Opened {site} and searched for: {query}."
+    except Exception as e:
+        return f"Could not open browser: {e}"
+
+
+def open_app(name_or_path: str) -> str:
+    """
+    Open an application by common name, display name, or path.
+    Tries: COMMON_APPS -> path exists -> Start Menu search -> shell.
+    Returns a short status message.
+    """
+    name_lower = name_or_path.strip().lower()
+    if name_lower in COMMON_APPS:
+        cmd = COMMON_APPS[name_lower]
+        try:
+            if cmd[0] == "start":
+                subprocess.Popen("start " + " ".join(cmd[1:]), shell=True)
+            else:
+                subprocess.Popen(cmd, shell=False)
+            return f"Opened {name_or_path}."
+        except Exception as e:
+            return f"Could not open {name_or_path}: {e}"
+
+    # Treat as path if it exists
+    if os.path.exists(name_or_path):
+        try:
+            subprocess.Popen([name_or_path], shell=False)
+            return f"Opened {name_or_path}."
+        except Exception as e:
+            return f"Could not open: {e}"
+
+    # Search Start Menu: "open spotify", "open minecraft", "open valorant", etc.
+    lnk_path = _find_app_in_start_menu(name_or_path)
+    if lnk_path:
+        try:
+            os.startfile(lnk_path)
+            return f"Opened {name_or_path}."
+        except Exception as e:
+            return f"Could not open {name_or_path}: {e}"
+
+    # Last resort: try as shell command (e.g. "notepad")
+    try:
+        subprocess.Popen(name_or_path, shell=True)
+        return f"Opened {name_or_path}."
+    except Exception as e:
+        return f"Could not open {name_or_path}: {e}"
+
+
+def type_text(text: str, interval: float = 0.02) -> str:
+    """Type a string using the keyboard (current focus gets the input)."""
+    if not text:
+        return "No text to type."
+    try:
+        pyautogui.write(text, interval=interval)
+        return f"Typed: {text[:50]}{'...' if len(text) > 50 else ''}"
+    except Exception as e:
+        return f"Could not type: {e}"
+
+
+def press_key(key_name: str) -> str:
+    """Press a key or key combo (e.g. 'enter', 'ctrl+c', 'alt+tab')."""
+    key_map = {
+        "enter": Key.enter,
+        "tab": Key.tab,
+        "space": Key.space,
+        "backspace": Key.backspace,
+        "escape": Key.esc,
+        "up": Key.up,
+        "down": Key.down,
+        "left": Key.left,
+        "right": Key.right,
+        "home": Key.home,
+        "end": Key.end,
+        "page up": Key.page_up,
+        "page down": Key.page_down,
+    }
+    key_name = key_name.strip().lower()
+    if key_name in key_map:
+        try:
+            _keyboard.press(key_map[key_name])
+            _keyboard.release(key_map[key_name])
+            return f"Pressed {key_name}."
+        except Exception as e:
+            return f"Could not press key: {e}"
+
+    # Combo like ctrl+c
+    parts = [p.strip().lower() for p in key_name.split("+")]
+    mods = []
+    for p in parts[:-1]:
+        if p == "ctrl":
+            mods.append(Key.ctrl)
+        elif p == "alt":
+            mods.append(Key.alt)
+        elif p == "shift":
+            mods.append(Key.shift)
+        elif p == "win":
+            mods.append(Key.cmd)  # Windows key
+    if not mods and len(parts) == 1:
+        return f"Unknown key: {key_name}"
+    try:
+        with _keyboard.pressed(*mods):
+            last = parts[-1]
+            if last in key_map:
+                _keyboard.press(key_map[last])
+                _keyboard.release(key_map[last])
+            else:
+                _keyboard.press(last)
+                _keyboard.release(last)
+        return f"Pressed {key_name}."
+    except Exception as e:
+        return f"Could not press key: {e}"
+
+
+def mouse_move(x: Optional[int] = None, y: Optional[int] = None, relative: bool = False) -> str:
+    """Move mouse to (x,y). If relative=True, move by delta."""
+    try:
+        if relative:
+            pyautogui.moveRel(x or 0, y or 0)
+        else:
+            pyautogui.moveTo(x or 0, y or 0)
+        return "Mouse moved."
+    except Exception as e:
+        return f"Could not move mouse: {e}"
+
+
+def mouse_click(button: str = "left", clicks: int = 1) -> str:
+    """Click mouse button: left, right, or middle."""
+    try:
+        pyautogui.click(button=button, clicks=clicks)
+        return f"Clicked {button} {clicks} time(s)."
+    except Exception as e:
+        return f"Could not click: {e}"
+
+
+def screenshot_bytes(all_monitors: bool = True) -> Optional[bytes]:
+    """Capture the screen as PNG bytes for vision analysis. On Windows, all_monitors=True captures every monitor."""
+    try:
+        if all_monitors and os.name == "nt":
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(all_screens=True)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+            except (ImportError, TypeError, Exception):
+                pass
+        img = pyautogui.screenshot()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def get_screen_size() -> Tuple[int, int]:
+    """Return (width, height) of the virtual screen (all monitors combined)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            u32 = ctypes.windll.user32
+            w = u32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            h = u32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            pass
+    w, h = pyautogui.size()
+    return (w, h)
+
+
+def _screen_coords_from_image(x: int, y: int) -> Tuple[int, int]:
+    """Convert image coords (0,0 = top-left of capture) to actual screen coords for click."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            u32 = ctypes.windll.user32
+            ox = u32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            oy = u32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            return (x + ox, y + oy)
+        except Exception:
+            pass
+    return (x, y)
+
+
+def click_at(x: int, y: int) -> str:
+    """Click at pixel coordinates (works across all monitors)."""
+    try:
+        pyautogui.click(x, y)
+        return f"Clicked at ({x}, {y})."
+    except Exception as e:
+        return f"Could not click: {e}"
+
+
+def click_screen_region(region: str) -> str:
+    """Click at a screen region. Uses virtual screen size for multi-monitor."""
+    try:
+        w, h = get_screen_size()
+        regions = {
+            "topleft": (w // 4, h // 4),
+            "topcenter": (w // 2, h // 4),
+            "topright": (3 * w // 4, h // 4),
+            "middleleft": (w // 4, h // 2),
+            "center": (w // 2, h // 2),
+            "middleright": (3 * w // 4, h // 2),
+            "bottomleft": (w // 4, 3 * h // 4),
+            "bottomcenter": (w // 2, 3 * h // 4),
+            "bottomright": (3 * w // 4, 3 * h // 4),
+        }
+        key = region.strip().lower().replace(" ", "").replace("-", "")
+        if key not in regions:
+            return f"Unknown region: {region}. Use: topleft, topcenter, center, etc."
+        x, y = regions[key]
+        sx, sy = _screen_coords_from_image(x, y)
+        pyautogui.click(sx, sy)
+        return f"Clicked at {region}."
+    except Exception as e:
+        return f"Could not click: {e}"
+
+
+def click_on_screen(target: str) -> str:
+    """Use vision to find target on screen and click at its location. Works across all monitors."""
+    try:
+        from . import vision
+        png = screenshot_bytes(all_monitors=True)
+        if not png:
+            return "Could not capture the screen."
+        result = vision.locate_in_screenshot(png, target)
+        if result is None:
+            return f"Could not find '{target}' on the screen."
+        if isinstance(result, tuple):
+            x, y = result
+            sx, sy = _screen_coords_from_image(x, y)
+            return click_at(sx, sy)
+        return click_screen_region(result)
+    except Exception as e:
+        return f"Could not click on {target}: {e}"
+
+
+def mouse_scroll(delta: int, x: Optional[int] = None, y: Optional[int] = None) -> str:
+    """Scroll. delta: positive = up, negative = down. Optional (x,y) position."""
+    try:
+        if x is not None and y is not None:
+            pyautogui.scroll(delta, x=x, y=y)
+        else:
+            pyautogui.scroll(delta)
+        return "Scrolled."
+    except Exception as e:
+        return f"Could not scroll: {e}"
+
+
+def take_screenshot(save_path: Optional[str] = None) -> str:
+    """Take a screenshot. If save_path given, save there; else save to screenshot.png."""
+    try:
+        path = save_path or "screenshot.png"
+        pyautogui.screenshot(path)
+        return f"Screenshot saved to {path}."
+    except Exception as e:
+        return f"Screenshot failed: {e}"
+
+
+def get_system_info() -> str:
+    """Return a short string with CPU and memory usage."""
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        return f"CPU: {cpu}% | RAM: {mem.percent}% used ({mem.used // (1024**3)}GB / {mem.total // (1024**3)}GB)"
+    except Exception as e:
+        return f"Could not get system info: {e}"
+
+
+def get_clipboard() -> str:
+    """Return current clipboard text."""
+    try:
+        import pyperclip
+        return pyperclip.paste() or "(empty)"
+    except Exception as e:
+        return f"Could not read clipboard: {e}"
+
+
+def set_clipboard(text: str) -> str:
+    """Set clipboard to the given text."""
+    try:
+        import pyperclip
+        pyperclip.copy(text)
+        return "Clipboard updated."
+    except Exception as e:
+        return f"Could not set clipboard: {e}"
+
+
+def lock_pc() -> str:
+    """Lock the workstation (Windows)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.LockWorkStation()
+        return "PC locked."
+    except Exception as e:
+        return f"Could not lock: {e}"
+
+
+def volume_up() -> str:
+    """Increase system volume (Windows: simulate volume up key)."""
+    try:
+        import pyautogui
+        pyautogui.press("volumeup", presses=3)
+        return "Volume up."
+    except Exception as e:
+        return f"Could not change volume: {e}"
+
+
+def volume_down() -> str:
+    """Decrease system volume."""
+    try:
+        pyautogui.press("volumedown", presses=3)
+        return "Volume down."
+    except Exception as e:
+        return f"Could not change volume: {e}"
+
+
+def volume_mute() -> str:
+    """Toggle mute."""
+    try:
+        pyautogui.press("volumemute")
+        return "Mute toggled."
+    except Exception as e:
+        return f"Could not mute: {e}"
+
+
+def set_volume_percent(percent: int) -> str:
+    """Set system volume to 0-100 percent. Uses pycaw on Windows if available: pip install pycaw comtypes"""
+    percent = max(0, min(100, int(percent)))
+    if os.name == "nt":
+        try:
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = cast(interface, POINTER(IAudioEndpointVolume))
+            volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            return f"Volume set to {percent}%."
+        except ImportError:
+            pass
+        except Exception:
+            pass
+    presses = max(1, min(10, int(percent / 10)))
+    try:
+        pyautogui.press("volumeup", presses=presses)
+        return f"Volume adjusted. For precise control: pip install pycaw comtypes"
+    except Exception as e:
+        return f"Could not set volume: {e}"
+
+
+def list_directory(folder: str = "") -> str:
+    """List contents of a folder. Default: user's home or Desktop."""
+    try:
+        if not folder or folder.strip().lower() in ("desktop", "my desktop"):
+            folder = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
+        elif folder.strip().lower() in ("downloads", "download"):
+            folder = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Downloads")
+        elif folder.strip().lower() in ("documents", "docs"):
+            folder = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Documents")
+        else:
+            folder = os.path.expanduser(folder.strip())
+        if not os.path.isdir(folder):
+            return f"Folder not found: {folder}"
+        names = os.listdir(folder)
+        names.sort(key=lambda x: (not os.path.isdir(os.path.join(folder, x)), x.lower()))
+        lines = [f"Contents of {os.path.basename(folder) or folder}:"]
+        for n in names[:50]:
+            path = os.path.join(folder, n)
+            lines.append(f"  {'[DIR] ' if os.path.isdir(path) else ''}{n}")
+        if len(names) > 50:
+            lines.append(f"  ... and {len(names) - 50} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Could not list folder: {e}"
+
+
+def create_folder(path: str) -> str:
+    """Create a folder. Path can be 'Desktop\\MyFolder' or full path."""
+    try:
+        path = path.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop", path)
+        path = os.path.normpath(path)
+        os.makedirs(path, exist_ok=True)
+        return f"Created folder: {path}."
+    except Exception as e:
+        return f"Could not create folder: {e}"
+
+
+def open_folder(path: str) -> str:
+    """Open a folder in Explorer. Path can be 'Desktop', 'Downloads', or path."""
+    try:
+        path = path.strip()
+        if path.lower() in ("desktop", "my desktop"):
+            path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop")
+        elif path.lower() in ("downloads", "download"):
+            path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Downloads")
+        elif path.lower() in ("documents", "docs"):
+            path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Documents")
+        else:
+            path = os.path.expanduser(path)
+        path = os.path.normpath(path)
+        if os.path.isdir(path):
+            os.startfile(path)
+            return f"Opened folder."
+        if os.path.isfile(path):
+            os.startfile(path)
+            return "Opened file."
+        return f"Not found: {path}"
+    except Exception as e:
+        return f"Could not open: {e}"
+</file>
+
+<file path="assistant/file_ops.py">
+"""File operations: create, read, append, overwrite, delete files."""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+_USERPROFILE = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+
+
+def _resolve_folder(location: str) -> str:
+    """Resolve 'desktop', 'documents', 'downloads' to full path."""
+    loc = (location or "").strip().lower()
+    if loc in ("desktop", "my desktop"):
+        return os.path.join(_USERPROFILE, "Desktop")
+    if loc in ("documents", "docs"):
+        return os.path.join(_USERPROFILE, "Documents")
+    if loc in ("downloads", "download"):
+        return os.path.join(_USERPROFILE, "Downloads")
+    return os.path.join(_USERPROFILE, "Desktop")
+
+
+def resolve_path(location: str, filename: str) -> str:
+    """
+    Resolve a file path. location can be 'desktop', 'documents', 'downloads',
+    or a path. filename is the file name. Returns absolute path.
+    """
+    location = (location or "desktop").strip()
+    filename = (filename or "").strip()
+    if not filename:
+        raise ValueError("Filename is required")
+    if os.path.isabs(filename) and os.path.dirname(filename):
+        return os.path.normpath(filename)
+    base = _resolve_folder(location) if location.lower() in ("desktop", "documents", "downloads", "docs", "download", "my desktop") else os.path.expanduser(location)
+    if not os.path.isdir(base):
+        base = _resolve_folder("desktop")
+    return os.path.normpath(os.path.join(base, filename))
+
+
+def create_file(path: str, content: str = "") -> str:
+    """Create a text file at path with optional content. Overwrites if exists."""
+    try:
+        path = os.path.normpath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Created file: {path}"
+    except Exception as e:
+        return f"Could not create file: {e}"
+
+
+def read_file(path: str) -> str:
+    """Read contents of a text file."""
+    try:
+        path = os.path.normpath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            return f"File not found: {path}"
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        return f"Could not read file: {e}"
+
+
+def append_to_file(path: str, content: str) -> str:
+    """Append text to a file. Creates file if it doesn't exist."""
+    try:
+        path = os.path.normpath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(content)
+        return f"Appended to {path}"
+    except Exception as e:
+        return f"Could not append to file: {e}"
+
+
+def write_file(path: str, content: str) -> str:
+    """Overwrite a file with new content."""
+    try:
+        path = os.path.normpath(os.path.expanduser(path))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Wrote to {path}"
+    except Exception as e:
+        return f"Could not write file: {e}"
+
+
+def delete_file(path: str) -> str:
+    """Delete a file."""
+    try:
+        path = os.path.normpath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            return f"File not found: {path}"
+        os.remove(path)
+        return f"Deleted {path}"
+    except Exception as e:
+        return f"Could not delete file: {e}"
+</file>
+
+<file path="assistant/math_helper.py">
+"""Safe evaluation of simple math expressions (no code execution)."""
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+
+def safe_calculate(expression: str) -> Optional[float]:
+    """
+    Evaluate a simple math expression. Supports + - * / % and numbers.
+    Handles "X percent of Y" -> X/100 * Y.
+    Returns None if invalid.
+    """
+    s = expression.strip().lower()
+    # "15 percent of 80" -> 0.15 * 80
+    m = re.match(r"^(.+?)\s*percent\s+of\s+(.+)$", s)
+    if m:
+        try:
+            a = _eval_simple(m.group(1).strip())
+            b = _eval_simple(m.group(2).strip())
+            if a is not None and b is not None:
+                return (a / 100.0) * b
+        except Exception:
+            pass
+        return None
+    return _eval_simple(s)
+
+
+def _eval_simple(s: str) -> Optional[float]:
+    """Only allow numbers and + - * / ( ) . and spaces."""
+    s = s.replace(" ", "")
+    if not re.match(r"^[\d+\-*/().%\s]+$", s):
+        return None
+    try:
+        # Replace % with * 0.01 for "50%" style
+        s = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1 * 0.01)", s)
+        return float(eval(s))
+    except Exception:
+        return None
+</file>
+
+<file path="assistant/notes.py">
+"""Notes and todo list — persisted to JSON."""
+from __future__ import annotations
+
+import json
+import os
+from typing import List
+
+import config
+
+_DATA_DIR = (config.DATA_DIR or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))).rstrip("/\\")
+_TODOS_FILE = os.path.join(_DATA_DIR, "jarvis_todos.json")
+_NOTES_FILE = os.path.join(_DATA_DIR, "jarvis_notes.json")
+
+
+def _ensure_dir() -> None:
+    if _DATA_DIR and not os.path.isdir(_DATA_DIR):
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+
+def get_todos() -> List[str]:
+    try:
+        _ensure_dir()
+        if os.path.isfile(_TODOS_FILE):
+            with open(_TODOS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def add_todo(item: str) -> str:
+    todos = get_todos()
+    todos.append(item.strip())
+    try:
+        _ensure_dir()
+        with open(_TODOS_FILE, "w", encoding="utf-8") as f:
+            json.dump(todos, f, indent=2)
+        return f"Added \"{item.strip()}\" to your list."
+    except Exception as e:
+        return f"Could not save: {e}"
+
+
+def clear_todos() -> str:
+    try:
+        if os.path.isfile(_TODOS_FILE):
+            os.remove(_TODOS_FILE)
+        return "Your to-do list is cleared."
+    except Exception as e:
+        return f"Could not clear: {e}"
+
+
+def remove_todo(index: int) -> str:
+    todos = get_todos()
+    if 1 <= index <= len(todos):
+        removed = todos.pop(index - 1)
+        try:
+            with open(_TODOS_FILE, "w", encoding="utf-8") as f:
+                json.dump(todos, f, indent=2)
+            return f"Removed: {removed}."
+        except Exception as e:
+            return f"Could not save: {e}"
+    return "No such item number."
+
+
+def get_notes() -> List[str]:
+    try:
+        _ensure_dir()
+        if os.path.isfile(_NOTES_FILE):
+            with open(_NOTES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def add_note(note: str) -> str:
+    notes = get_notes()
+    notes.append(note.strip())
+    try:
+        _ensure_dir()
+        with open(_NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(notes, f, indent=2)
+        return "Note saved."
+    except Exception as e:
+        return f"Could not save note: {e}"
+
+
+def list_notes_summary() -> str:
+    notes = get_notes()
+    if not notes:
+        return "You have no notes."
+    lines = [f"You have {len(notes)} note(s):"]
+    for i, n in enumerate(notes[-10:], 1):
+        preview = (n[:60] + "…") if len(n) > 60 else n
+        lines.append(f"  {i}. {preview}")
+    return "\n".join(lines)
+</file>
+
+<file path="assistant/reminders.py">
+"""Persisted reminders (saved to JSON, checked on interval)."""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from typing import List, Tuple
+
+import config
+
+_DATA_DIR = (config.DATA_DIR or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))).rstrip("/\\")
+_REMINDERS_FILE = os.path.join(_DATA_DIR, "jarvis_reminders.json")
+
+
+def _ensure_dir() -> None:
+    if _DATA_DIR and not os.path.isdir(_DATA_DIR):
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+
+def _load() -> List[dict]:
+    try:
+        _ensure_dir()
+        if os.path.isfile(_REMINDERS_FILE):
+            with open(_REMINDERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save(reminders: List[dict]) -> None:
+    _ensure_dir()
+    with open(_REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reminders, f, indent=2)
+
+
+def add_reminder(when: datetime, message: str) -> str:
+    reminders = _load()
+    reminders.append({"when": when.isoformat(), "message": message.strip()})
+    _save(reminders)
+    return f"Reminder set for {when.strftime('%I:%M %p' if when.date() == datetime.now().date() else '%b %d at %I:%M %p')}: {message}."
+
+
+def check_due() -> List[str]:
+    """Return list of reminder messages that are due (and remove them)."""
+    now = datetime.now()
+    reminders = _load()
+    due = []
+    keep = []
+    for r in reminders:
+        try:
+            t = datetime.fromisoformat(r["when"])
+            if t <= now:
+                due.append(r.get("message", "Reminder"))
+            else:
+                keep.append(r)
+        except Exception:
+            keep.append(r)
+    if due:
+        _save(keep)
+    return due
+
+
+def list_upcoming() -> List[Tuple[datetime, str]]:
+    """Return list of (when, message) for upcoming reminders."""
+    now = datetime.now()
+    out = []
+    for r in _load():
+        try:
+            t = datetime.fromisoformat(r["when"])
+            if t > now:
+                out.append((t, r.get("message", "")))
+        except Exception:
+            pass
+    out.sort(key=lambda x: x[0])
+    return out[:10]
+</file>
+
+<file path="assistant/settings.py">
+"""Small persisted settings store (JSON) for UI selections like microphone."""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict
+
+import config
+
+
+def _data_dir() -> str:
+    base = (getattr(config, "DATA_DIR", "") or "").strip()
+    if base:
+        return os.path.normpath(base)
+    # Default: project root (same folder as main.py)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _path() -> str:
+    return os.path.join(_data_dir(), "jarvis_settings.json")
+
+
+def load() -> Dict[str, Any]:
+    try:
+        p = _path()
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save(data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(_data_dir(), exist_ok=True)
+        with open(_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def get(key: str, default: Any = None) -> Any:
+    return load().get(key, default)
+
+
+def set(key: str, value: Any) -> None:
+    data = load()
+    data[key] = value
+    save(data)
+</file>
+
+<file path="assistant/stt.py">
+"""Speech-to-text using local Whisper so we can process microphone input."""
+from __future__ import annotations
+
+import io
+import os
+import threading
+import wave
+from typing import Optional
+
+import config
+
+# Lazy-load Whisper (heavy); optional dependency
+_whisper_model = None
+# Whisper is not thread-safe; kv_cache corrupts when used concurrently
+_transcribe_lock = threading.Lock()
+
+# Whisper expects 16 kHz mono float32
+WHISPER_SAMPLE_RATE = 16000
+
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            import whisper
+            _whisper_model = whisper.load_model(config.WHISPER_MODEL)
+        except ImportError as e:
+            raise RuntimeError(
+                "Whisper is not installed. Install with: pip install openai-whisper"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Whisper model: {e}") from e
+    return _whisper_model
+
+
+def _wav_bytes_to_numpy(wav_bytes: bytes) -> "np.ndarray":
+    """Convert WAV bytes to float32 mono numpy array at 16 kHz. No ffmpeg needed."""
+    import numpy as np
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    if sample_width == 2:  # 16-bit
+        audio = np.frombuffer(raw, dtype=np.int16)
+    elif sample_width == 4:  # 32-bit
+        audio = np.frombuffer(raw, dtype=np.int32)
+    else:
+        raise ValueError(f"Unsupported sample width: {sample_width}")
+
+    audio = audio.astype(np.float32) / 32768.0
+
+    if n_channels == 2:
+        audio = audio.reshape(-1, 2).mean(axis=1)
+
+    if framerate != WHISPER_SAMPLE_RATE:
+        # Resample to 16 kHz using linear interpolation
+        duration = len(audio) / framerate
+        new_length = int(duration * WHISPER_SAMPLE_RATE)
+        indices = np.linspace(0, len(audio) - 1, new_length)
+        audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+    return audio
+
+
+def transcribe_audio_bytes(wav_bytes: bytes, language: Optional[str] = None) -> str:
+    """Transcribe raw WAV bytes (16-bit mono, 16kHz or 44.1kHz) to text. No ffmpeg required."""
+    model = _get_whisper()
+    audio = _wav_bytes_to_numpy(wav_bytes)
+    with _transcribe_lock:
+        result = model.transcribe(audio, language=language, fp16=False)
+    return (result.get("text") or "").strip()
+
+
+def transcribe_file(path: str, language: Optional[str] = None) -> str:
+    """Transcribe a WAV file to text."""
+    model = _get_whisper()
+    with _transcribe_lock:
+        result = model.transcribe(path, language=language, fp16=False)
+    return (result.get("text") or "").strip()
+
+
+def _record_via_ffmpeg(seconds: float, sample_rate: int = 16000) -> Optional[bytes]:
+    """Record using ffmpeg (Windows dshow or Linux alsa). Use when PyAudio is broken/unavailable."""
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            if os.name == "nt":
+                # Windows: use DirectShow. Try common device names.
+                for device in ["Microphone", "Audio (Microphone)", "Default"]:
+                    cmd = [
+                        "ffmpeg", "-y", "-loglevel", "error", "-f", "dshow",
+                        "-i", f"audio={device}",
+                        "-t", str(seconds),
+                        "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", "1",
+                        path,
+                    ]
+                    r = subprocess.run(cmd, capture_output=True, timeout=int(seconds) + 10)
+                    if r.returncode == 0 and os.path.isfile(path) and os.path.getsize(path) > 0:
+                        with open(path, "rb") as f:
+                            return f.read()
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error", "-f", "pulse" if os.path.exists("/dev/snd") else "alsa",
+                    "-i", "default",
+                    "-t", str(seconds),
+                    "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", "1",
+                    path,
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=int(seconds) + 10)
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    with open(path, "rb") as f:
+                        return f.read()
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _choose_input_device(pa) -> Optional[int]:
+    """
+    Choose a PyAudio input device based on config.MIC_DEVICE_INDEX or MIC_DEVICE_NAME.
+    Returns the device index or None to use the default.
+    """
+    index = getattr(config, "MIC_DEVICE_INDEX", None)
+    name_sub = (getattr(config, "MIC_DEVICE_NAME", "") or "").lower()
+    chosen: Optional[int] = None
+    try:
+        count = pa.get_device_count()
+    except Exception:
+        return None
+    # Explicit index takes priority
+    if isinstance(index, int):
+        try:
+            info = pa.get_device_info_by_index(index)
+            if info.get("maxInputChannels", 0) > 0:
+                chosen = index
+        except Exception:
+            chosen = None
+    # Otherwise, match by substring in name
+    if chosen is None and name_sub:
+        try:
+            for i in range(count):
+                try:
+                    info = pa.get_device_info_by_index(i)
+                    if info.get("maxInputChannels", 0) <= 0:
+                        continue
+                    if name_sub in str(info.get("name", "")).lower():
+                        chosen = i
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            chosen = None
+    return chosen
+
+
+def listen_until_silence(
+    max_wait_for_speech: float = 5.0,
+    silence_duration: float = 5.0,
+    max_recording_seconds: float = 45.0,
+    sample_rate: int = 16000,
+) -> Optional[bytes]:
+    """
+    Stream from the microphone with simple energy-based silence detection,
+    instead of recording a blind fixed duration:
+
+      - Waits up to `max_wait_for_speech` seconds for you to start talking.
+        If nothing is heard in that window, returns None - the caller should
+        treat that as "no one's talking, drop back to needing the wake word".
+      - Once speech is detected, keeps recording until `silence_duration`
+        seconds of continuous silence follow, then returns everything
+        captured (including a little audio from just before the threshold
+        was crossed, so the first syllable doesn't get clipped) as WAV bytes.
+      - `max_recording_seconds` is a hard cap so a noisy room (music, a TV)
+        can't keep it recording forever.
+
+    The silence threshold is auto-calibrated against a brief sample of
+    ambient room noise at the start of each call rather than a fixed
+    constant, since "quiet room" and "noisy room" differ by an order of
+    magnitude in practice. Tune via config.VAD_SILENCE_MULTIPLIER and
+    config.VAD_MIN_ENERGY_THRESHOLD if it's too trigger-happy or too
+    insensitive for your mic/room.
+
+    Returns None (no ffmpeg fallback here) if PyAudio/the mic isn't
+    available - ffmpeg only supports fixed-duration recording, not this
+    kind of streaming detection. record_from_microphone() still exists with
+    the ffmpeg fallback for callers that just need a fixed-length clip.
+    """
+    try:
+        import pyaudio
+        import numpy as np
+        from . import audio_devices
+    except Exception:
+        return None
+
+    import time as _time
+    from collections import deque
+
+    chunk_seconds = 0.1  # 100ms analysis window: responsive without being noisy
+    multiplier = getattr(config, "VAD_SILENCE_MULTIPLIER", 2.5)
+    min_threshold = getattr(config, "VAD_MIN_ENERGY_THRESHOLD", 150.0)
+
+    pa = None
+    stream = None
+    try:
+        pa = pyaudio.PyAudio()
+        device_index = _choose_input_device(pa)
+        stream, actual_rate = audio_devices.open_input_stream(
+            pa, device_index, preferred_rate=sample_rate, channels=1,
+            frames_per_buffer=max(1, int(sample_rate * chunk_seconds)),
+        )
+        chunk_frames = max(1, int(round(actual_rate * chunk_seconds)))
+
+        def read_chunk() -> "np.ndarray":
+            raw = stream.read(chunk_frames, exception_on_overflow=False)
+            return raw, np.frombuffer(raw, dtype=np.int16)
+
+        def rms(samples: "np.ndarray") -> float:
+            if len(samples) == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+
+        # Calibrate against ~300ms of ambient noise before listening for real.
+        ambient_samples = []
+        for _ in range(3):
+            try:
+                _, samples = read_chunk()
+                ambient_samples.append(rms(samples))
+            except Exception:
+                break
+        ambient_rms = sum(ambient_samples) / len(ambient_samples) if ambient_samples else 0.0
+        threshold = max(ambient_rms * multiplier, min_threshold)
+
+        pre_buffer: deque = deque(maxlen=2)  # ~200ms of lead-in, kept until speech starts
+        frames = []
+        speech_started = False
+        start_ts = _time.time()
+        last_voice_ts = start_ts
+
+        while True:
+            now = _time.time()
+            try:
+                raw, samples = read_chunk()
+            except Exception:
+                break
+
+            is_voice = rms(samples) > threshold
+
+            if not speech_started:
+                pre_buffer.append(raw)
+                if is_voice:
+                    speech_started = True
+                    frames = list(pre_buffer)
+                    last_voice_ts = now
+                elif now - start_ts >= max_wait_for_speech:
+                    return None  # nobody said anything - caller drops to wake-word mode
+            else:
+                frames.append(raw)
+                if is_voice:
+                    last_voice_ts = now
+                if now - last_voice_ts >= silence_duration:
+                    break  # done talking
+                if now - start_ts >= max_recording_seconds:
+                    break  # safety valve
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(actual_rate)
+            wf.writeframes(b"".join(frames))
+        return buf.getvalue()
+    except Exception:
+        return None
+    finally:
+        try:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+        except Exception:
+            pass
+        try:
+            if pa:
+                pa.terminate()
+        except Exception:
+            pass
+
+
+def record_from_microphone(seconds: float = 5.0, sample_rate: int = 16000) -> Optional[bytes]:
+    """
+    Record from the default microphone for `seconds` and return WAV bytes (16-bit mono).
+    Tries PyAudio first; if that fails (e.g. broken _portaudio), tries ffmpeg.
+    Returns None if both fail.
+    """
+    # Try PyAudio first (may print "Could not import PyAudio C module" to console if broken)
+    try:
+        import pyaudio
+        import wave
+        import io
+        from . import audio_devices
+        CHUNK = 1024
+        pa = pyaudio.PyAudio()
+        device_index = _choose_input_device(pa)
+        stream, actual_rate = audio_devices.open_input_stream(
+            pa, device_index, preferred_rate=sample_rate, channels=1, frames_per_buffer=CHUNK,
+        )
+        frames = []
+        n_chunks = int(actual_rate * seconds / CHUNK)
+        for _ in range(n_chunks):
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                frames.append(data)
+            except Exception:
+                break
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            # Write the rate we actually recorded at - _wav_bytes_to_numpy
+            # already resamples to WHISPER_SAMPLE_RATE based on this header,
+            # so this doesn't need to match `sample_rate` exactly.
+            wf.setframerate(actual_rate)
+            wf.writeframes(b"".join(frames))
+        return buf.getvalue()
+    except Exception:
+        pass
+    # Fallback: ffmpeg (no PyAudio needed). Install ffmpeg and add to PATH.
+    return _record_via_ffmpeg(seconds, sample_rate)
+</file>
+
+<file path="assistant/tts.py">
+"""Text-to-speech: pyttsx3 (offline) or edge-tts (higher quality, needs internet)."""
+from __future__ import annotations
+
+import queue
+import re
+import threading
+from typing import Optional
+
+import config
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+
+class TTS:
+    def __init__(self, rate: Optional[int] = None, volume: Optional[float] = None):
+        self._rate = rate if rate is not None else getattr(config, "TTS_RATE", 175)
+        self._volume = volume if volume is not None else getattr(config, "TTS_VOLUME", 1.0)
+        self._engine_name = getattr(config, "TTS_ENGINE", "pyttsx3").lower()
+        self._edge_voice = getattr(config, "TTS_EDGE_VOICE", "en-US-AriaNeural")
+        self._pyttsx_engine = None
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        # Optional callbacks for UI (e.g., visualizer)
+        self.on_start_speaking = None
+        self.on_stop_speaking = None
+
+    def _get_pyttsx(self):
+        if pyttsx3 is None:
+            raise RuntimeError("pyttsx3 is not installed. Install with: pip install pyttsx3")
+        if self._pyttsx_engine is None:
+            self._pyttsx_engine = pyttsx3.init()
+            self._pyttsx_engine.setProperty("rate", self._rate)
+            self._pyttsx_engine.setProperty("volume", self._volume)
+        return self._pyttsx_engine
+
+    def _speak_pyttsx3(self, text: str) -> None:
+        engine = self._get_pyttsx()
+        engine.say(text)
+        engine.runAndWait()
+
+    def _speak_edge(self, text: str) -> None:
+        if edge_tts is None:
+            raise RuntimeError("edge-tts is not installed. Install with: pip install edge-tts")
+        import asyncio
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            path = f.name
+        try:
+            async def _save():
+                communicate = edge_tts.Communicate(text, self._edge_voice)
+                await communicate.save(path)
+            asyncio.run(_save())
+            self._play_mp3(path, text)
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    def _play_mp3(self, path: str, text: str) -> None:
+        """Play an MP3 file (blocking). Tries playsound, then pygame, then system open."""
+        try:
+            import playsound
+            playsound.playsound(path, block=True)
+            return
+        except Exception:
+            pass
+        try:
+            import pygame
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=512)
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+            import time
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+            return
+        except Exception:
+            pass
+        import subprocess
+        import time
+        if os.name == "nt":
+            subprocess.Popen(["cmd", "/c", "start", "/wait", path], shell=True)
+            time.sleep(max(2, len(text) / 10))
+        else:
+            subprocess.run(["mpv", path, "--no-video"], capture_output=True)
+
+    def _sanitize_for_speech(self, text: str) -> str:
+        """Remove asterisks and other formatting that TTS reads aloud awkwardly."""
+        if not text:
+            return text
+        # Remove ** ... ** (bold markers) but keep the inner text
+        out = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        # Remove any remaining asterisks
+        out = out.replace("*", "")
+        # Collapse multiple spaces and trim
+        return re.sub(r"  +", " ", out).strip()
+
+    def _speak_one(self, text: str) -> None:
+        text = self._sanitize_for_speech(text)
+        if not text or not text.strip():
+            return
+        if callable(self.on_start_speaking):
+            try:
+                self.on_start_speaking()
+            except Exception:
+                pass
+        try:
+            if self._engine_name == "edge" and edge_tts:
+                try:
+                    self._speak_edge(text)
+                except Exception:
+                    if pyttsx3:
+                        self._speak_pyttsx3(text)
+                    else:
+                        raise
+            elif pyttsx3:
+                self._speak_pyttsx3(text)
+            else:
+                raise RuntimeError("No TTS engine available. Install pyttsx3 or edge-tts.")
+        finally:
+            if callable(self.on_stop_speaking):
+                try:
+                    self.on_stop_speaking()
+                except Exception:
+                    pass
+
+    def speak(self, text: str, block: bool = False) -> None:
+        """Speak `text`. If block=True, wait until done."""
+        if not text or not text.strip():
+            return
+        if block:
+            self._speak_one(text)
+            return
+        self._queue.put(text)
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(target=self._run_worker, daemon=True)
+            self._worker.start()
+
+    def _run_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not text:
+                continue
+            try:
+                self._speak_one(text)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._pyttsx_engine:
+            try:
+                self._pyttsx_engine.stop()
+            except Exception:
+                pass
+</file>
+
+<file path="assistant/vision.py">
+"""Camera capture and image description using Ollama LLaVA (vision) model."""
+from __future__ import annotations
+
+import base64
+import io
+import re
+from typing import Optional, Tuple, Union
+
+import config
+
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
+try:
+    from PIL import Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+try:
+    import numpy as _np  # used for gesture helpers
+except Exception:
+    _np = None
+
+try:
+    import ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
+
+# Max dimension for image sent to vision model (keeps inference fast)
+_VISION_MAX_DIM = getattr(config, "VISION_MAX_DIM", 768)
+
+# Optional: latest frame from live preview (set by main.py to avoid camera conflict)
+_preview_frame: dict = {"frame": None}
+
+
+def set_preview_frame(frame_bgr) -> None:
+    """Register the latest frame from the live camera preview. Vision queries will use this if available."""
+    _preview_frame["frame"] = frame_bgr
+
+
+def clear_preview_frame() -> None:
+    """Clear the preview frame (call when camera preview stops)."""
+    _preview_frame["frame"] = None
+
+
+def capture_frame(camera_index: Optional[int] = None) -> Optional[bytes]:
+    """
+    Capture a single frame from the webcam as PNG bytes.
+    Uses the live preview frame if available (avoids camera conflict).
+    Returns None if camera or OpenCV not available.
+    """
+    if not _CV2_AVAILABLE:
+        return None
+    frame = _preview_frame.get("frame")
+    if frame is not None:
+        try:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            from PIL import Image
+            pil = Image.fromarray(frame_rgb)
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            pass
+    idx = camera_index if camera_index is not None else config.CAMERA_INDEX
+    cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        return None
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return None
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    from PIL import Image
+    pil = Image.fromarray(frame_rgb)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def describe_image(image_bytes: bytes, prompt: str = "Describe what you see in this image in one or two sentences.") -> str:
+    """
+    Send image to Ollama vision model and return description.
+    """
+    if not _OLLAMA_AVAILABLE:
+        return "Ollama is not installed or not available."
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        response = ollama.chat(
+            model=config.OLLAMA_VISION_MODEL,
+            keep_alive=getattr(config, "OLLAMA_KEEP_ALIVE", "30m"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [b64],
+                }
+            ],
+        )
+        return (response.get("message", {}).get("content") or "No description.").strip()
+    except Exception as e:
+        return f"Vision model error: {e}"
+
+
+def what_do_you_see(camera_index: Optional[int] = None, question: Optional[str] = None) -> str:
+    """
+    Capture from webcam and describe using the vision model.
+    If question is provided, asks that specific question about the image.
+    """
+    png_bytes = capture_frame(camera_index)
+    if png_bytes is None:
+        return "Could not access the camera. Start the camera preview first, or ensure the webcam is connected and not in use."
+    if question and question.strip():
+        prompt = f"Answer this question about the image in one or two sentences: {question.strip()}"
+        return describe_image(png_bytes, prompt=prompt)
+    return describe_image(png_bytes)
+
+
+def open_camera_stream(camera_index: Optional[int] = None):
+    """
+    Simple generator yielding BGR frames from the camera.
+    The caller is responsible for releasing the capture.
+    """
+    if not _CV2_AVAILABLE:
+        return None
+    idx = camera_index if camera_index is not None else config.CAMERA_INDEX
+    cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        return None
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            yield frame
+    finally:
+        cap.release()
+
+
+def bgr_to_tk_image(frame_bgr, size: Optional[Tuple[int, int]] = None):
+    """
+    Convert an OpenCV BGR frame to a Pillow Image usable by Tkinter/CTk.
+    """
+    if frame_bgr is None:
+        return None
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    from PIL import Image
+
+    img = Image.fromarray(frame_rgb)
+    if size:
+        img = img.resize(size)
+    return img
+
+
+def count_fingers_simple(frame_bgr) -> Optional[int]:
+    """
+    Very lightweight, best-effort finger counter using contour/convex hull.
+    This is not perfect but works reasonably for a hand against a simple background.
+    """
+    if not _CV2_AVAILABLE or _np is None or frame_bgr is None:
+        return None
+    frame = cv2.resize(frame_bgr, (320, 240))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh = cv2.bitwise_not(thresh)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 1000:
+        return None
+    hull = cv2.convexHull(cnt, returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return None
+    defects = cv2.convexityDefects(cnt, hull)
+    if defects is None:
+        return None
+    finger_gaps = 0
+    for i in range(defects.shape[0]):
+        s, e, f, d = defects[i, 0]
+        start = tuple(cnt[s][0])
+        end = tuple(cnt[e][0])
+        far = tuple(cnt[f][0])
+        a = _np.linalg.norm(_np.array(end) - _np.array(start))
+        b = _np.linalg.norm(_np.array(far) - _np.array(start))
+        c = _np.linalg.norm(_np.array(end) - _np.array(far))
+        if b * c == 0:
+            continue
+        angle = _np.degrees(_np.arccos((b**2 + c**2 - a**2) / (2 * b * c)))
+        if angle < 80 and d > 1000:
+            finger_gaps += 1
+    fingers = min(finger_gaps + 1, 5)
+    if fingers <= 0:
+        return None
+    return fingers
+
+
+def locate_in_screenshot(
+    image_bytes: bytes, target_description: str
+) -> Optional[Union[Tuple[int, int], str]]:
+    """
+    Use vision model to find where a target element is on screen.
+    Returns (x, y) pixel coordinates if found, or a region name as fallback.
+    Returns None if target not found or vision fails.
+    """
+    if not _OLLAMA_AVAILABLE:
+        return None
+    if not _PIL_AVAILABLE:
+        return _locate_region_fallback(image_bytes, target_description)
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        orig_w, orig_h = img.size
+        scale = 1.0
+        max_dim = _VISION_MAX_DIM
+        if max(orig_w, orig_h) > max_dim:
+            scale = max_dim / max(orig_w, orig_h)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        scaled_bytes = buf.getvalue()
+        img_w, img_h = img.size
+
+        prompt = (
+            f"Click target: {target_description}. Image size {img_w}x{img_h}. "
+            "Reply ONLY with: X Y (pixel coords of center). Example: 450 320"
+        )
+        b64 = base64.b64encode(scaled_bytes).decode("utf-8")
+        response = ollama.chat(
+            model=config.OLLAMA_VISION_MODEL,
+            keep_alive=getattr(config, "OLLAMA_KEEP_ALIVE", "30m"),
+            messages=[{"role": "user", "content": prompt, "images": [b64]}],
+        )
+        raw = (response.get("message", {}).get("content") or "").strip()
+
+        coords = _parse_coordinates(raw, img_w, img_h)
+        if coords:
+            x, y = coords
+            real_x = int(x / scale)
+            real_y = int(y / scale)
+            real_x = max(0, min(orig_w - 1, real_x))
+            real_y = max(0, min(orig_h - 1, real_y))
+            return (real_x, real_y)
+
+        return _locate_region_fallback(image_bytes, target_description)
+    except Exception:
+        return _locate_region_fallback(image_bytes, target_description)
+
+
+def _parse_coordinates(text: str, max_x: int, max_y: int) -> Optional[Tuple[int, int]]:
+    """Extract x,y from model response. Expects formats like '450 320' or '450, 320'."""
+    if not text:
+        return None
+    match = re.search(r"(\d+)\s*[,x]\s*(\d+)", text, re.I)
+    if match:
+        try:
+            x = int(match.group(1))
+            y = int(match.group(2))
+            x = max(0, min(max_x - 1, x))
+            y = max(0, min(max_y - 1, y))
+            return (x, y)
+        except (ValueError, IndexError):
+            pass
+    parts = re.findall(r"\d+", text)
+    if len(parts) >= 2:
+        try:
+            x = int(parts[0])
+            y = int(parts[1])
+            x = max(0, min(max_x - 1, x))
+            y = max(0, min(max_y - 1, y))
+            return (x, y)
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+def _locate_region_fallback(image_bytes: bytes, target_description: str) -> Optional[str]:
+    """Fallback: ask for region name instead of coordinates."""
+    if not _OLLAMA_AVAILABLE:
+        return None
+    prompt = (
+        f"Click: {target_description}. Region? Reply one word: topleft,topcenter,topright,"
+        "middleleft,center,middleright,bottomleft,bottomcenter,bottomright"
+    )
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        response = ollama.chat(
+            model=config.OLLAMA_VISION_MODEL,
+            keep_alive=getattr(config, "OLLAMA_KEEP_ALIVE", "30m"),
+            messages=[{"role": "user", "content": prompt, "images": [b64]}],
+        )
+        raw = (response.get("message", {}).get("content") or "").strip().lower()
+        regions = ["topleft", "topcenter", "topright", "middleleft", "center", "middleright",
+                   "bottomleft", "bottomcenter", "bottomright"]
+        for r in regions:
+            if r in raw or r.replace("middle", "mid") in raw:
+                return r
+        if "top left" in raw or "top-left" in raw:
+            return "topleft"
+        if "top right" in raw or "top-right" in raw:
+            return "topright"
+        if "top center" in raw or "top-center" in raw:
+            return "topcenter"
+        if "bottom left" in raw or "bottom-left" in raw:
+            return "bottomleft"
+        if "bottom right" in raw or "bottom-right" in raw:
+            return "bottomright"
+        if "bottom center" in raw or "bottom-center" in raw:
+            return "bottomcenter"
+        if "middle left" in raw or "mid left" in raw:
+            return "middleleft"
+        if "middle right" in raw or "mid right" in raw:
+            return "middleright"
+        if "centre" in raw or "center" in raw:
+            return "center"
+    except Exception:
+        pass
+    return None
+
+
+def describe_screen(question: Optional[str] = None) -> str:
+    """Capture the screen (all monitors) and describe it using the vision model."""
+    try:
+        from . import computer
+        png = computer.screenshot_bytes(all_monitors=True)
+        if not png:
+            return "Could not capture the screen."
+        png = _resize_for_vision(png)
+        if question and question.strip():
+            prompt = f"Screenshot. Answer: {question.strip()}"
+        else:
+            prompt = "Describe this screenshot in 1-2 sentences."
+        return describe_image(png, prompt=prompt)
+    except Exception as e:
+        return f"Could not describe screen: {e}"
+
+
+def _resize_for_vision(image_bytes: bytes) -> bytes:
+    """Resize image to max dimension for faster vision inference."""
+    if not _PIL_AVAILABLE:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        if max(w, h) <= _VISION_MAX_DIM:
+            return image_bytes
+        scale = _VISION_MAX_DIM / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
+def describe_hand_gesture() -> str:
+    """
+    Capture one frame and try to describe how many fingers are extended.
+    Uses the live preview frame if available.
+    """
+    if not _CV2_AVAILABLE:
+        return "Hand gesture detection requires OpenCV. Please install opencv-python."
+    frame = _preview_frame.get("frame")
+    if frame is None:
+        cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        if not cap.isOpened():
+            return "Could not access the camera. Start the camera preview first, or ensure the webcam is connected."
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return "Could not capture an image for gesture detection."
+    fingers = count_fingers_simple(frame)
+    if fingers is None:
+        return "I couldn't confidently detect your hand or fingers. Try moving closer and using a plain background."
+    if fingers == 1:
+        return "It looks like you are holding up 1 finger."
+    return f"It looks like you are holding up {fingers} fingers."
+</file>
+
+<file path="assistant/wake_word.py">
+"""Wake word detection: listen for 'Hey Jarvis' to activate."""
+from __future__ import annotations
+
+import threading
+import time
+from typing import Callable, Optional
+
+try:
+    import pyaudio  # can fail with broken C module '_portaudio'
+    import numpy as np
+    import openwakeword
+    from openwakeword.model import Model
+    import config
+    from . import audio_devices
+    _OWW_AVAILABLE = True
+except Exception:
+    _OWW_AVAILABLE = False
+
+# Cooldown between detections (seconds)
+WAKE_COOLDOWN = 2.0
+SAMPLE_RATE = 16000
+CHUNK = 1280
+_WAKE_MODEL_NAME = "hey_jarvis"
+
+
+def run_wake_word_loop(
+    on_wake: Callable[[], None],
+    stop_event: Optional[threading.Event] = None,
+    on_status: Optional[Callable[[str], None]] = None,
+) -> None:
+    """
+    Blocking loop: listen for "hey jarvis" and call on_wake() when detected.
+    Uses openwakeword's dedicated "hey_jarvis" model (ONNX backend, so no
+    separate tflite_runtime dependency needed).
+
+    on_status, if given, receives short human-readable status/error strings.
+    Wire it to your UI's log - setup problems here (missing model download,
+    no usable microphone, etc.) used to fail completely silently, which is
+    why "say the wake word" could just quietly do nothing forever with no
+    indication why.
+    """
+    def status(msg: str) -> None:
+        if on_status:
+            try:
+                on_status(msg)
+            except Exception:
+                pass
+
+    if not _OWW_AVAILABLE:
+        status("Wake word unavailable: openwakeword/pyaudio/numpy not installed.")
+        return
+
+    # openwakeword ships model *definitions* but not the model weight files -
+    # those are downloaded on first use and cached under the openwakeword
+    # package directory. This is idempotent (skips re-downloading if already
+    # present), so it's safe to call on every startup.
+    try:
+        openwakeword.utils.download_models([_WAKE_MODEL_NAME])
+    except Exception as e:
+        status(f"Could not download the wake word model ({e}). Check your internet connection.")
+        return
+
+    try:
+        oww_model = Model(wakeword_models=[_WAKE_MODEL_NAME], inference_framework="onnx")
+    except Exception as e:
+        status(f"Wake word model failed to load: {e}")
+        return
+
+    pa = pyaudio.PyAudio()
+    device_index = None
+    device_label = "system default"
+    try:
+        index = getattr(config, "MIC_DEVICE_INDEX", None)
+        name_sub = (getattr(config, "MIC_DEVICE_NAME", "") or "").lower()
+        count = pa.get_device_count()
+        if isinstance(index, int):
+            try:
+                info = pa.get_device_info_by_index(index)
+                if info.get("maxInputChannels", 0) > 0:
+                    device_index = index
+                    device_label = str(info.get("name", index))
+            except Exception:
+                device_index = None
+        if device_index is None and name_sub:
+            for i in range(count):
+                try:
+                    info = pa.get_device_info_by_index(i)
+                    if info.get("maxInputChannels", 0) <= 0:
+                        continue
+                    if name_sub in str(info.get("name", "")).lower():
+                        device_index = i
+                        device_label = str(info.get("name", i))
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        device_index = None
+
+    try:
+        stream, actual_rate = audio_devices.open_input_stream(
+            pa,
+            device_index,
+            preferred_rate=SAMPLE_RATE,
+            channels=1,
+            frames_per_buffer=CHUNK,
+        )
+    except Exception as e:
+        status(f"Could not open microphone ({device_label}): {e}")
+        pa.terminate()
+        return
+
+    if actual_rate != SAMPLE_RATE:
+        status(
+            f'"{device_label}" doesn\'t support 16kHz directly - recording at '
+            f"{actual_rate}Hz and converting. This should still work fine."
+        )
+    else:
+        status(f'Wake word ready - listening on "{device_label}" for "hey Jarvis".')
+
+    # If we had to fall back to the device's native rate, each read() gives us
+    # native-rate samples covering the same time window as CHUNK would at
+    # 16kHz - resample that down to CHUNK samples at 16kHz before handing it
+    # to the model, which expects 16kHz input.
+    read_size = int(round(CHUNK * actual_rate / SAMPLE_RATE))
+
+    last_wake = 0.0
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                raw = stream.read(read_size, exception_on_overflow=False)
+            except Exception as e:
+                status(f"Microphone read failed, wake word stopped: {e}")
+                break
+            audio = np.frombuffer(raw, dtype=np.int16)
+            if actual_rate != SAMPLE_RATE and len(audio) > 1:
+                # Simple linear-interpolation resample - good enough for wake
+                # word detection, which doesn't need studio-quality audio.
+                orig_idx = np.linspace(0, len(audio) - 1, CHUNK)
+                audio = np.interp(orig_idx, np.arange(len(audio)), audio).astype(np.int16)
+            prediction = oww_model.predict(audio)
+            score = prediction.get(_WAKE_MODEL_NAME, 0.0)
+            if score > 0.5 and (time.time() - last_wake) >= WAKE_COOLDOWN:
+                last_wake = time.time()
+                on_wake()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        status(f"Wake word loop stopped unexpectedly: {e}")
+    finally:
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        pa.terminate()
+
+
+def start_wake_word_background(
+    on_wake: Callable[[], None],
+    stop_event: Optional[threading.Event] = None,
+    on_status: Optional[Callable[[str], None]] = None,
+) -> threading.Thread:
+    """Start wake word detection in a daemon thread. Returns the thread."""
+    def run():
+        try:
+            run_wake_word_loop(on_wake, stop_event=stop_event, on_status=on_status)
+        except Exception as e:
+            if on_status:
+                try:
+                    on_status(f"Wake word thread crashed: {e}")
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+</file>
+
+<file path="assistant/weather.py">
+"""Weather via Open-Meteo (no API key)."""
+from __future__ import annotations
+
+from typing import Optional
+
+import config
+
+_UNITS = config.WEATHER_UNITS if hasattr(config, "WEATHER_UNITS") else "imperial"
+
+
+def get_weather(city_or_zip: Optional[str] = None) -> str:
+    """
+    Get current weather. If city_or_zip is None, tries to use IP-based location.
+    Otherwise pass a city name or "zip: 90210" style.
+    """
+    try:
+        import requests
+    except ImportError:
+        return "Requests library is required for weather."
+
+    base = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,precipitation",
+        "temperature_unit": "fahrenheit" if _UNITS == "imperial" else "celsius",
+        "wind_speed_unit": "mph" if _UNITS == "imperial" else "kmh",
+    }
+    lat, lon = None, None
+    if city_or_zip and city_or_zip.strip():
+        place = city_or_zip.strip()
+        if place.lower().startswith("zip") or place[0].isdigit():
+            # Geocode zip/code
+            try:
+                r = requests.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": place.replace("zip", "").strip(), "count": 1},
+                    timeout=5,
+                )
+                if r.ok and r.json().get("results"):
+                    res = r.json()["results"][0]
+                    lat, lon = res["latitude"], res["longitude"]
+                    place = res.get("name", place)
+            except Exception:
+                pass
+        if lat is None:
+            try:
+                r = requests.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": place, "count": 1},
+                    timeout=5,
+                )
+                if r.ok and r.json().get("results"):
+                    res = r.json()["results"][0]
+                    lat, lon = res["latitude"], res["longitude"]
+                    place = res.get("name", place)
+            except Exception:
+                pass
+    if lat is None:
+        try:
+            r = requests.get("https://ipapi.co/json/", timeout=5)
+            if r.ok:
+                data = r.json()
+                lat, lon = data.get("latitude"), data.get("longitude")
+                place = data.get("city", "your location")
+        except Exception:
+            place = "your location"
+            lat, lon = 40.7, -74.0
+    if lat is None or lon is None:
+        lat, lon = 40.7, -74.0
+    params["latitude"] = lat
+    params["longitude"] = lon
+    try:
+        r = requests.get(base, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        cur = data.get("current", {})
+        temp = cur.get("temperature_2m", "?")
+        unit = "°F" if _UNITS == "imperial" else "°C"
+        code = cur.get("weather_code", 0)
+        desc = _weather_desc(code)
+        wind = cur.get("wind_speed_10m", "?")
+        return f"In {place}: {temp}{unit}, {desc}. Wind {wind}."
+    except Exception as e:
+        return f"Weather unavailable: {e}"
+
+
+def _weather_desc(code: int) -> str:
+    codes = {
+        0: "clear",
+        1: "mainly clear",
+        2: "partly cloudy",
+        3: "overcast",
+        45: "foggy",
+        48: "foggy",
+        51: "drizzle",
+        53: "drizzle",
+        55: "drizzle",
+        61: "light rain",
+        63: "rain",
+        65: "heavy rain",
+        71: "snow",
+        73: "snow",
+        75: "heavy snow",
+        80: "rain showers",
+        81: "rain showers",
+        82: "heavy rain showers",
+        95: "thunderstorm",
+        96: "thunderstorm with hail",
+    }
+    return codes.get(code, "unknown conditions")
+</file>
+
+<file path="assistant/web_search.py">
+"""Web search: Google (Custom Search API) or DuckDuckGo fallback."""
+from __future__ import annotations
+
+import os
+from typing import List
+
+import config
+
+
+def _google_search(query: str, max_results: int) -> List[dict]:
+    """Use Google Custom Search JSON API. Returns list of dicts with title, url, snippet."""
+    api_key = os.environ.get("GOOGLE_SEARCH_API_KEY", "").strip() or (config.GOOGLE_SEARCH_API_KEY or "").strip()
+    cx = os.environ.get("GOOGLE_SEARCH_ENGINE_ID", "").strip() or (config.GOOGLE_SEARCH_ENGINE_ID or "").strip()
+    if not api_key or not cx:
+        return []
+    try:
+        import requests
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": api_key,
+            "cx": cx,
+            "q": query,
+            "num": min(max_results, 10),
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in data.get("items", [])[:max_results]:
+            out.append({
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _duckduckgo_search(query: str, max_results: int) -> List[dict]:
+    """Fallback: DuckDuckGo (no API key)."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        out = []
+        for r in results:
+            out.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", r.get("url", "")),
+                "snippet": r.get("body", r.get("snippet", "")),
+            })
+        return out
+    except Exception as e:
+        return [{"title": "Error", "url": "", "snippet": str(e)}]
+
+
+def search(query: str, max_results: int | None = None) -> List[dict]:
+    """
+    Search the web. Uses Google if API key and engine ID are set, else DuckDuckGo.
+    Returns list of dicts with keys: title, url, snippet.
+    """
+    max_results = max_results or config.WEB_SEARCH_MAX_RESULTS
+    results = _google_search(query, max_results)
+    if not results:
+        results = _duckduckgo_search(query, max_results)
+    return results
+
+
+def search_summary(query: str, max_results: int = 3) -> str:
+    """Return a single string summary of search results for the query."""
+    results = search(query, max_results=max_results)
+    if not results or (len(results) == 1 and "Error" in results[0].get("title", "")):
+        return f"Search failed or no results for: {query}"
+    lines = [f"Search results for \"{query}\":"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r.get('title', '')} - {r.get('url', '')}")
+        lines.append(f"   {r.get('snippet', '')}")
+    return "\n".join(lines)
+</file>
+
+<file path=".env.example">
+# Copy this file to ".env" (same folder) and fill in real values there.
+# .env is listed in .gitignore and will never be committed or shared.
+# Leave a value blank to disable that feature (e.g. web search falls back to DuckDuckGo
+# automatically if these are blank).
+
+GOOGLE_SEARCH_API_KEY=
+GOOGLE_SEARCH_ENGINE_ID=
+</file>
+
+<file path=".gitignore">
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Local data Jarvis creates at runtime
+jarvis_todos.json
+jarvis_notes.json
+jarvis_reminders.json
+jarvis_settings.json
+jarvis_memory.db
+screenshot.png
+
+# Editor/OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+</file>
+
+<file path="config.py">
+# Jarvis-like Assistant - Configuration
+# Edit these to customize wake word, models, and behavior.
+#
+# ---------------------------------------------------------------------------
+# DEPENDENCIES (pip packages). Install before running. Copy-paste this line:
+#   pip install pyttsx3 openwakeword numpy pyautogui pynput psutil duckduckgo-search requests opencv-python Pillow ollama customtkinter python-dotenv pyperclip schedule
+# Optional (voice input): pip install openai-whisper
+# Optional (better TTS): pip install edge-tts playsound   (then set TTS_ENGINE = "edge" below)
+# Optional (wake word + Listen mic): pip install pyaudio   OR install ffmpeg and add to PATH (Listen will use ffmpeg if pyaudio fails)
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    # Loads variables from a local .env file (same folder as this file) into the
+    # process environment. .env is gitignored - see .env.example for the template.
+    _load_dotenv(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass  # python-dotenv not installed yet; env vars set another way still work
+
+# Wake word phrase (used for display; detection may use a similar model)
+WAKE_WORD = "Hey Jarvis"
+
+# Ollama model for chat and command understanding
+# qwen2.5:7b = best instruction-following, minimal roleplay, fast. Run: ollama pull qwen2.5:7b
+# Alternatives: command-r:7b, mistral:7b-instruct, phi3:latest, llama3.2
+OLLAMA_CHAT_MODEL = "qwen2.5:7b"
+
+# Ollama vision model for camera "what do you see"
+OLLAMA_VISION_MODEL = "llava"
+
+# Ollama base URL (default: local)
+OLLAMA_HOST = "http://localhost:11434"
+
+# How long Ollama keeps a model loaded in memory after a request before
+# unloading it. Ollama's own default is 5 minutes ("5m"); reloading a
+# multi-GB model from disk is usually the single biggest cause of slow
+# responses, so this project uses a longer default. "-1" keeps it loaded
+# indefinitely (fastest, but ties up RAM/VRAM even when idle); "30m" is a
+# reasonable middle ground. Lower this if you're tight on memory and running
+# other GPU/RAM-heavy programs alongside Jarvis.
+OLLAMA_KEEP_ALIVE = "30m"
+
+# Whisper model size: tiny, base, small, medium, large (larger = more accurate, slower)
+# Use "tiny" for fastest local transcription.
+WHISPER_MODEL = "tiny"
+
+# TTS: "pyttsx3" (offline, fastest to start speaking) or "edge" (better quality, slower, needs internet)
+# For edge: pip install edge-tts
+TTS_ENGINE = "edge"
+
+# Edge TTS voice (only when TTS_ENGINE = "edge"). Examples:
+#   en-US-AriaNeural (female), en-US-GuyNeural (male), en-GB-SoniaNeural, en-AU-NatashaNeural
+TTS_EDGE_VOICE = "en-GB-RyanNeural"
+
+# Pyttsx3 only: voice rate (wpm) and volume (0.0-1.0)
+TTS_RATE = 195
+TTS_VOLUME = 1.2
+
+# Web search: max results to return
+WEB_SEARCH_MAX_RESULTS = 5
+
+# Google search (optional). If set, uses Google instead of DuckDuckGo.
+# Get API key: https://console.cloud.google.com/ (enable Custom Search API)
+# Get search engine ID: https://programmablesearchengine.google.com/ (create a search engine)
+# Free tier: 100 queries/day.
+#
+# SECURITY: these are now loaded from a local .env file (see .env.example) instead of
+# being hardcoded here. Never put real keys directly in config.py again - config.py is
+# the kind of file that ends up shared, zipped, or committed by accident.
+GOOGLE_SEARCH_API_KEY = _os.environ.get("GOOGLE_SEARCH_API_KEY", "")
+GOOGLE_SEARCH_ENGINE_ID = _os.environ.get("GOOGLE_SEARCH_ENGINE_ID", "")
+
+# Camera: index (0 = default webcam)
+CAMERA_INDEX = 0
+
+# Always speak every response out loud (so you hear replies without looking at the screen)
+SPEAK_RESPONSES = True
+
+# Microphone selection for wake word and voice input:
+# - MIC_DEVICE_INDEX: explicit PyAudio device index (see \"list microphones\" command)
+# - MIC_DEVICE_NAME: substring to match in device name (e.g. \"yeti\", \"usb microphone\");
+#   used if MIC_DEVICE_INDEX is None.
+MIC_DEVICE_INDEX = 3  # e.g. 0, 1, 2 ...
+MIC_DEVICE_NAME = None
+
+# Conversation listening (silence-based, not a fixed duration): after the wake
+# word or after Jarvis finishes speaking, the mic opens and waits for you to
+# start talking. If you don't within CONVERSATION_SILENCE_TIMEOUT_SECONDS, it
+# drops back to needing the wake word. Once you start talking, it keeps
+# recording until that many seconds of continuous silence follow, then treats
+# that as the end of your sentence.
+CONVERSATION_SILENCE_TIMEOUT_SECONDS = 5.0
+# Hard cap on a single utterance's length, regardless of silence detection -
+# a safety valve against a noisy room (TV, music) that never reads as "silent".
+CONVERSATION_MAX_UTTERANCE_SECONDS = 45.0
+
+# Voice-activity detection sensitivity for the above. The silence threshold is
+# auto-calibrated against a brief ambient-noise sample each time Jarvis starts
+# listening, then scaled by VAD_SILENCE_MULTIPLIER, with VAD_MIN_ENERGY_THRESHOLD
+# as a floor so a near-silent room doesn't make it overly trigger-happy on tiny
+# noises. Raise VAD_SILENCE_MULTIPLIER or VAD_MIN_ENERGY_THRESHOLD if it's
+# picking up background noise as speech; lower them if it's cutting you off or
+# not noticing you've started talking.
+VAD_SILENCE_MULTIPLIER = 2.5
+VAD_MIN_ENERGY_THRESHOLD = 150.0
+
+# Used by the manual "Listen" button (fixed-duration recording, unrelated to
+# the silence-based conversation loop above) and as a fallback recording
+# length wherever a fixed duration is still needed.
+LISTEN_DURATION_SECONDS = 5.0
+
+# Timer check interval in milliseconds (how often to check for due timers)
+TIMER_CHECK_INTERVAL_MS = 2000
+
+# Data folder for notes, todos, reminders (default: same folder as main.py)
+DATA_DIR = ""
+
+# How many recent user/assistant turns to send to Ollama for context (0 = no history)
+# Lower = faster responses, less context. 4 is optimal for speed + continuity.
+CONVERSATION_HISTORY_SIZE = 4
+
+# Weather: "metric" (C) or "imperial" (F)
+WEATHER_UNITS = "imperial"
+
+# Ollama timeout in seconds (0 = no timeout)
+OLLAMA_TIMEOUT = 30
+
+# Strip roleplay/formatting from LLM responses (asterisks, *actions*, etc.)
+STRIP_ROLEPLAY = True
+
+# Vision speed: max image dimension sent to LLaVA (lower = faster, less precise). 768 is a good balance.
+VISION_MAX_DIM = 768
+
+# Seconds to wait for page load before screenshot (search+add-to-cart flow)
+PAGE_LOAD_WAIT_SECONDS = 4.0
+
+# System prompt for LLM: enforce strict instruction-following, zero roleplay
+SYSTEM_PROMPT_STRICT = (
+    "You are a direct command executor. Execute exactly what the user asks. "
+    "Never roleplay. Never use asterisks, *actions*, or **bold** for actions. "
+    "Never say you cannot do something if the user requested it. "
+    "Respond in plain text only. Be terse and factual. No embellishment."
+)
+</file>
+
+<file path="main.py">
+"""
+Jarvis-like Local Assistant - Main entry point.
+Run with: python main.py
+"""
+from __future__ import annotations
+
+import os
+import warnings
+
+# Suppress CTkLabel HighDPI warning for camera preview (we use PhotoImage for stability)
+warnings.filterwarnings("ignore", message=".*Given image is not CTkImage.*", module="customtkinter")
+import queue
+import threading
+from typing import Optional
+
+# Set Ollama host from config before any module imports ollama
+import config
+os.environ.setdefault("OLLAMA_HOST", config.OLLAMA_HOST)
+
+import customtkinter as ctk
+from assistant import brain, stt, tts, wake_word
+from assistant import audio_devices, settings
+from assistant import vision
+
+# Theme: dark Jarvis-style
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# Response queue so TTS and UI updates don't block
+response_queue: queue.Queue = queue.Queue()
+
+
+def append_log(log_widget: ctk.CTkTextbox, line: str, tag: str = "response") -> None:
+    def do():
+        log_widget.configure(state="normal")
+        log_widget.insert("end", line + "\n")
+        log_widget.see("end")
+        log_widget.configure(state="disabled")
+    log_widget.after(0, do)
+
+
+def process_and_respond(
+    user_text: str,
+    log_widget: ctk.CTkTextbox,
+    tts_engine: Optional[tts.TTS],
+    speak: bool,
+    status_label: Optional[ctk.CTkLabel] = None,
+) -> None:
+    if not user_text.strip():
+        return
+    append_log(log_widget, f"You: {user_text}", "user")
+    # Immediate feedback - show executing state before thread starts
+    if status_label:
+        status_label.configure(text="Executing...", text_color="#06b6d4")
+
+    def run_brain() -> None:
+        if status_label:
+            log_widget.after(0, lambda: status_label.configure(text="Processing...", text_color="#06b6d4"))
+        try:
+            reply = brain.process(user_text)
+            def done() -> None:
+                if status_label:
+                    status_label.configure(text="Ready", text_color="#22c55e")
+                append_log(log_widget, f"Jarvis: {reply}", "response")
+                # Always speak every response when TTS is available (so you hear it without looking)
+                if tts_engine and reply:
+                    tts_engine.speak(reply, block=False)
+            log_widget.after(0, done)
+        except Exception as e:
+            def err() -> None:
+                if status_label:
+                    status_label.configure(text="Error", text_color="#ef4444")
+                append_log(log_widget, f"Jarvis: Error — {e}", "error")
+                if tts_engine:
+                    tts_engine.speak(f"Sorry, something went wrong. {e}", block=False)
+            log_widget.after(0, err)
+
+    threading.Thread(target=run_brain, daemon=True).start()
+
+
+def on_wake(log_widget: ctk.CTkTextbox, tts_engine: Optional[tts.TTS], speak: bool, status_label: Optional[ctk.CTkLabel] = None) -> None:
+    """Called when wake word is detected: start a conversation session.
+
+    Always conversational now (no toggle) - after each response, it goes
+    straight back to listening. A session only ends when you go quiet for
+    config.CONVERSATION_SILENCE_TIMEOUT_SECONDS with nothing new to say, at
+    which point the wake word is needed again.
+    """
+    def do():
+        append_log(log_widget, "[Wake word detected — listening...]", "system")
+
+        def set_status(text: str, color: str) -> None:
+            if status_label:
+                log_widget.after(0, lambda: status_label.configure(text=text, text_color=color))
+
+        def conversation_loop() -> None:
+            while True:
+                set_status("Listening...", "#06b6d4")
+                try:
+                    wav = stt.listen_until_silence(
+                        max_wait_for_speech=config.CONVERSATION_SILENCE_TIMEOUT_SECONDS,
+                        silence_duration=config.CONVERSATION_SILENCE_TIMEOUT_SECONDS,
+                        max_recording_seconds=config.CONVERSATION_MAX_UTTERANCE_SECONDS,
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    log_widget.after(0, lambda m=msg: append_log(log_widget, f"Voice input: {m}", "system"))
+                    break
+
+                if not wav:
+                    # Either the mic isn't available, or nobody said anything
+                    # within the timeout - either way, stop listening.
+                    break
+
+                try:
+                    text = stt.transcribe_audio_bytes(wav)
+                except RuntimeError as e:
+                    msg = str(e)
+                    log_widget.after(0, lambda m=msg: append_log(log_widget, f"Voice input: {m}", "system"))
+                    break
+
+                if not text or not text.strip():
+                    # Silence detector triggered on a cough/noise, not real
+                    # speech - just keep listening rather than ending the session.
+                    continue
+
+                log_widget.after(0, lambda t=text: append_log(log_widget, f"You: {t}", "user"))
+                set_status("Processing...", "#06b6d4")
+                try:
+                    reply = brain.process(text)
+                except Exception as e:
+                    reply = f"Sorry, something went wrong. {e}"
+                    set_status("Error", "#ef4444")
+
+                log_widget.after(0, lambda r=reply: append_log(log_widget, f"Jarvis: {r}", "response"))
+                if tts_engine and reply:
+                    set_status("Speaking...", "#06b6d4")
+                    # block=True is essential here: without it, the loop would
+                    # go straight back to listening while Jarvis is still
+                    # talking, and the mic would pick up his own voice.
+                    tts_engine.speak(reply, block=True)
+                # Loop back to listening - this is what makes it "conversational"
+                # without needing a toggle.
+
+            set_status("Ready", "#22c55e")
+            log_widget.after(
+                0, lambda: append_log(log_widget, "[Done listening — say the wake word to talk again.]", "system")
+            )
+
+        threading.Thread(target=conversation_loop, daemon=True).start()
+    log_widget.after(0, do)
+
+
+def main() -> None:
+    app = ctk.CTk()
+    app.title("Jarvis — Command Execution System")
+    app.geometry("1000x640")
+    app.minsize(800, 520)
+
+    # Refined dark theme - professional, minimal
+    bg_dark = "#0a0e17"
+    accent = "#06b6d4"
+    accent_dim = "#0891b2"
+    panel_bg = "#0f172a"
+    border_glow = "#1e293b"
+    text_primary = "#e2e8f0"
+    text_muted = "#94a3b8"
+    success = "#22c55e"
+    error = "#ef4444"
+    app.configure(fg_color=bg_dark)
+
+    # TTS (optional)
+    try:
+        tts_engine = tts.TTS()
+        # Visualizer hooks – these will be bound after vis_bar is created
+    except Exception:
+        tts_engine = None
+
+    # ==== HEADER / STATUS BAR ====
+    header = ctk.CTkFrame(app, fg_color=panel_bg, height=52, corner_radius=0)
+    header.pack(fill="x", padx=0, pady=(0, 6))
+    header.pack_propagate(False)
+
+    title_label = ctk.CTkLabel(
+        header,
+        text="JARVIS",
+        font=ctk.CTkFont(size=20, weight="bold"),
+        text_color=accent,
+    )
+    title_label.pack(side="left", padx=20)
+
+    subtitle_label = ctk.CTkLabel(
+        header,
+        text="Direct command execution — zero roleplay",
+        font=ctk.CTkFont(size=11),
+        text_color=text_muted,
+    )
+    subtitle_label.pack(side="left", padx=(8, 0))
+
+    # Load saved mic selection (if any) and apply to config in-memory
+    saved_mic_index = settings.get("mic_device_index", None)
+    if isinstance(saved_mic_index, int):
+        config.MIC_DEVICE_INDEX = saved_mic_index
+        config.MIC_DEVICE_NAME = ""
+
+    # Mic dropdown (changes wake word mic immediately)
+    mic_devices = audio_devices.list_input_devices()
+    if mic_devices:
+        options = [f"{i}: {name}" for i, name in mic_devices]
+    else:
+        options = ["(PyAudio mic list unavailable)"]
+
+    mic_var = ctk.StringVar(value=options[0])
+    # If a saved index exists, try to select it
+    if isinstance(saved_mic_index, int) and mic_devices:
+        for i, name in mic_devices:
+            if i == saved_mic_index:
+                mic_var.set(f"{i}: {name}")
+                break
+
+    mic_menu = ctk.CTkOptionMenu(
+        header,
+        values=options,
+        variable=mic_var,
+        width=220,
+        height=30,
+        dynamic_resizing=False,
+    )
+    mic_menu.pack(side="right", padx=14)
+
+    mic_label = ctk.CTkLabel(header, text="Mic", font=ctk.CTkFont(size=12), text_color=text_muted)
+    mic_label.pack(side="right", padx=(0, 8))
+
+    # ==== MAIN BODY: LEFT (CHAT), RIGHT (CAMERA + VISUALIZER) ====
+    body = ctk.CTkFrame(app, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=12, pady=(2, 10))
+
+    # Left column: chat log + status + input
+    left_col = ctk.CTkFrame(body, fg_color=panel_bg, corner_radius=14, border_width=1, border_color=border_glow)
+    left_col.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=0)
+
+    # Chat log
+    log = ctk.CTkTextbox(
+        left_col,
+        font=ctk.CTkFont(family="Consolas", size=13),
+        wrap="word",
+        state="disabled",
+        corner_radius=8,
+    )
+    log.pack(fill="both", expand=True, padx=14, pady=(12, 6))
+    log.configure(text_color=text_primary)
+    append_log(
+        log,
+        "Ready. Type a command or say the wake word. Commands execute immediately with no roleplay.",
+        "system",
+    )
+
+    # Status row (conversational mode toggle removed - Jarvis is always
+    # conversational now: after the wake word or a response, it keeps
+    # listening on its own until you go quiet for a few seconds)
+    status_row = ctk.CTkFrame(left_col, fg_color="transparent")
+    status_row.pack(fill="x", padx=12, pady=(0, 2))
+
+    status_label = ctk.CTkLabel(status_row, text="Ready", font=ctk.CTkFont(size=12), text_color="#22c55e")
+    status_label.pack(side="left")
+
+    # Input row
+    input_frame = ctk.CTkFrame(left_col, fg_color="transparent")
+    input_frame.pack(fill="x", padx=12, pady=(4, 10))
+
+    entry = ctk.CTkEntry(
+        input_frame,
+        placeholder_text="Command — e.g. Open Notepad, Search for X, Type hello",
+        height=42,
+        font=ctk.CTkFont(size=14),
+        corner_radius=10,
+    )
+    entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+    def send_text() -> None:
+        t = entry.get().strip()
+        entry.delete(0, "end")
+        if t:
+            process_and_respond(t, log, tts_engine, speak=bool(tts_engine), status_label=status_label)
+
+    entry.bind("<Return>", lambda e: send_text())
+    entry.bind("<Control-Return>", lambda e: send_text())
+
+    send_btn = ctk.CTkButton(
+        input_frame,
+        text="Execute",
+        width=90,
+        height=38,
+        command=send_text,
+        corner_radius=10,
+        fg_color=accent,
+        hover_color=accent_dim,
+    )
+    send_btn.pack(side="right", padx=(0, 10))
+
+    # Right column: camera and visualizer panels
+    right_col = ctk.CTkFrame(body, fg_color=panel_bg, corner_radius=14, border_width=1, border_color=border_glow)
+    right_col.pack(side="right", fill="both", expand=False, padx=(8, 0), pady=0)
+
+    right_col.grid_rowconfigure(0, weight=3)
+    right_col.grid_rowconfigure(1, weight=2)
+    right_col.grid_columnconfigure(0, weight=1)
+
+    camera_panel = ctk.CTkFrame(right_col, fg_color="#050b1f", corner_radius=14)
+    camera_panel.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+
+    visualizer_panel = ctk.CTkFrame(right_col, fg_color="#050918", corner_radius=14)
+    visualizer_panel.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 10))
+
+    # Camera controls + preview
+    cam_header = ctk.CTkFrame(camera_panel, fg_color="transparent")
+    cam_header.pack(fill="x", padx=10, pady=(8, 4))
+
+    cam_title = ctk.CTkLabel(
+        cam_header,
+        text="Camera",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        text_color=accent,
+    )
+    cam_title.pack(side="left")
+
+    camera_running = {"on": False}
+    _cam_img_ref = {"ctk_img": None}
+    _latest_frame = {"frame": None, "lock": threading.Lock()}
+    _cap_holder = {"cap": None}  # persistent VideoCapture
+
+    cam_preview = ctk.CTkLabel(
+        camera_panel,
+        text="Camera offline",
+        font=ctk.CTkFont(size=14),
+        text_color="#7b8499",
+    )
+    cam_preview.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+    def _camera_capture_thread():
+        import cv2
+        cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        if not cap.isOpened():
+            camera_running["on"] = False
+            return
+        _cap_holder["cap"] = cap
+        try:
+            while camera_running["on"]:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    camera_running["on"] = False
+                    break
+                with _latest_frame["lock"]:
+                    _latest_frame["frame"] = frame
+                vision.set_preview_frame(frame)
+        except Exception:
+            camera_running["on"] = False
+        finally:
+            cap.release()
+            _cap_holder["cap"] = None
+
+    def _update_camera_display():
+        if not camera_running["on"]:
+            return
+        with _latest_frame["lock"]:
+            frame = _latest_frame["frame"]
+        if frame is None:
+            app.after(33, _update_camera_display)
+            return
+        try:
+            img = vision.bgr_to_tk_image(frame, size=(260, 160))
+            if img is not None:
+                from PIL import ImageTk
+                photo = ImageTk.PhotoImage(img)
+                _cam_img_ref["ctk_img"] = photo
+                cam_preview.configure(image=photo, text="")
+        except Exception:
+            camera_running["on"] = False
+            try:
+                cam_preview.configure(image=None, text="Camera unavailable")
+            except Exception:
+                pass
+            return
+        app.after(33, _update_camera_display)
+
+    def _start_camera():
+        if camera_running["on"]:
+            return
+        camera_running["on"] = True
+        with _latest_frame["lock"]:
+            _latest_frame["frame"] = None
+        threading.Thread(target=_camera_capture_thread, daemon=True).start()
+        app.after(50, _update_camera_display)
+
+    def _stop_camera():
+        camera_running["on"] = False
+        vision.clear_preview_frame()
+        app.after(100, lambda: cam_preview.configure(image=None, text="Camera offline"))
+
+    cam_controls = ctk.CTkFrame(camera_panel, fg_color="transparent")
+    cam_controls.pack(fill="x", padx=10, pady=(0, 8))
+
+    cam_start_btn = ctk.CTkButton(cam_controls, text="Start", width=60, command=_start_camera)
+    cam_start_btn.pack(side="left", padx=(0, 6))
+
+    cam_stop_btn = ctk.CTkButton(cam_controls, text="Stop", width=60, command=_stop_camera)
+    cam_stop_btn.pack(side="left", padx=(0, 6))
+
+    # Multi-bar voice visualizer (smooth spectrum-style)
+    vis_label = ctk.CTkLabel(
+        visualizer_panel,
+        text="Voice",
+        font=ctk.CTkFont(size=13),
+        text_color="#7b8499",
+    )
+    vis_label.pack(pady=(10, 4))
+    import tkinter as tk
+    vis_canvas = tk.Canvas(
+        visualizer_panel,
+        width=260,
+        height=56,
+        bg="#050918",
+        highlightthickness=0,
+    )
+    vis_canvas.pack(padx=16, pady=(0, 12))
+
+    NUM_BARS = 14
+    BAR_GAP = 4
+    BAR_WIDTH = (260 - (NUM_BARS - 1) * BAR_GAP) // NUM_BARS
+    BAR_MAX_H = 48
+    _vis_state = {"speaking": False, "phase": 0.0, "bar_heights": [0.0] * NUM_BARS}
+    _vis_rects = []
+
+    def _draw_visualizer():
+        import math
+        state = _vis_state
+        target = state["bar_heights"]
+        if state["speaking"]:
+            state["phase"] += 0.25
+            for i in range(NUM_BARS):
+                t = (state["phase"] + i * 0.4) % (2 * math.pi)
+                target[i] = 0.12 + 0.88 * (0.5 + 0.5 * math.sin(t)) * (0.6 + 0.4 * math.sin(i * 0.7 + state["phase"] * 0.5))
+        else:
+            decay = 0.82
+            for i in range(NUM_BARS):
+                target[i] *= decay
+
+        for i in range(NUM_BARS):
+            h = max(2, int(BAR_MAX_H * target[i]))
+            x = 10 + i * (BAR_WIDTH + BAR_GAP)
+            y1 = 4 + BAR_MAX_H - h
+            y2 = 4 + BAR_MAX_H
+            color = accent if state["speaking"] else "#2a4a6a"
+            vis_canvas.itemconfig(_vis_rects[i], fill=color, outline=color)
+            vis_canvas.coords(_vis_rects[i], x, y1, x + BAR_WIDTH, y2)
+
+        if state["speaking"] or any(t > 0.02 for t in target):
+            app.after(36, _draw_visualizer)
+
+    for i in range(NUM_BARS):
+        x = 10 + i * (BAR_WIDTH + BAR_GAP)
+        r = vis_canvas.create_rectangle(x, BAR_MAX_H, x + BAR_WIDTH, BAR_MAX_H, fill="#1a2a3a", outline="#1a2a3a")
+        _vis_rects.append(r)
+
+    if tts_engine:
+        def _vis_start() -> None:
+            _vis_state["speaking"] = True
+            _draw_visualizer()
+
+        def _vis_stop() -> None:
+            _vis_state["speaking"] = False
+
+        tts_engine.on_start_speaking = _vis_start
+        tts_engine.on_stop_speaking = _vis_stop
+        tts_engine.speak("Online sir.", block=False)
+
+    # Wake word controller (so we can restart when mic changes)
+    wake_stop = threading.Event()
+    wake_thread = None
+
+    def start_wake() -> None:
+        nonlocal wake_thread
+        wake_stop.clear()
+
+        def _on_wake_status(msg: str) -> None:
+            # Called from the wake-word background thread - hand off to the
+            # Tkinter main thread instead of touching the widget directly.
+            app.after(0, lambda: append_log(log, msg, "system"))
+
+        wake_thread = wake_word.start_wake_word_background(
+            lambda: on_wake(log, tts_engine, bool(tts_engine), status_label),
+            stop_event=wake_stop,
+            on_status=_on_wake_status,
+        )
+
+    def restart_wake() -> None:
+        wake_stop.set()
+        # give the thread a moment to exit its loop
+        app.after(250, start_wake)
+
+    # Start wake word - actual readiness/errors are reported by _on_wake_status
+    # above as they happen, rather than assumed here.
+    try:
+        start_wake()
+    except Exception as e:
+        append_log(log, f"Wake word failed to start: {e}", "system")
+
+    def on_mic_change(_choice: str) -> None:
+        choice = mic_var.get()
+        # Parse leading index "N: ..."
+        try:
+            idx_str = choice.split(":", 1)[0].strip()
+            idx = int(idx_str)
+        except Exception:
+            append_log(log, "Could not change mic (invalid selection).", "system")
+            return
+        config.MIC_DEVICE_INDEX = idx
+        config.MIC_DEVICE_NAME = ""
+        settings.set("mic_device_index", idx)
+        append_log(log, f"Microphone set to device index {idx}. Restarting wake word...", "system")
+        restart_wake()
+
+    if mic_devices:
+        mic_menu.configure(command=on_mic_change)
+    else:
+        mic_menu.configure(state="disabled")
+
+    def check_timers() -> None:
+        due = brain.check_timers()
+        for msg in due:
+            append_log(log, f"Jarvis: Timer: {msg}", "response")
+            if tts_engine and config.SPEAK_RESPONSES:
+                tts_engine.speak(f"Reminder: {msg}", block=False)
+        for msg in brain.check_reminders():
+            append_log(log, f"Jarvis: Reminder: {msg}", "response")
+            if tts_engine and config.SPEAK_RESPONSES:
+                tts_engine.speak(f"Reminder: {msg}", block=False)
+        app.after(config.TIMER_CHECK_INTERVAL_MS, check_timers)
+
+    app.after(config.TIMER_CHECK_INTERVAL_MS, check_timers)
+
+    def _on_close():
+        camera_running["on"] = False
+        if tts_engine:
+            tts_engine.stop()
+        app.destroy()
+
+    app.protocol("WM_DELETE_WINDOW", _on_close)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="README.md">
+# Jarvis-like Local Assistant
+
+A voice-controlled, locally-running AI assistant inspired by Iron Man's J.A.R.V.I.S. It listens for a wake word, takes voice or text input, and executes commands directly on your computer — search, control apps, type, mouse, camera, and more.
+
+**Architecture (Phase 1):** Jarvis runs on a tool-calling planner — the LLM is given a registry of tools (open an app, read a file, search the web, etc.) and decides which to call and in what order, instead of matching your exact phrasing against hardcoded patterns. This means paraphrasing and multi-step requests ("open notepad and type today's date") work without any per-phrase code. See `assistant/agent/` for the implementation.
+
+**Memory (Phase 2):** Jarvis now remembers things about you across restarts — facts, preferences, and habits are stored locally in `jarvis_memory.db` and automatically pulled into context on every relevant message, so you don't have to repeat yourself between sessions. See `assistant/memory/` for the implementation, and `PHASE3_HANDOFF.md` for the full technical writeup and what's next.
+
+## Features
+
+- **Wake word** – Say "Hey Jarvis" to start a conversation
+- **Always-conversational voice** – No toggle to turn on: after the wake word (or after each response), the mic stays open and listens until you go quiet for a few seconds, then processes what you said. After responding, it goes right back to listening - keep talking naturally without repeating the wake word each time. Only stops and needs "Hey Jarvis" again once you've gone quiet for `config.CONVERSATION_SILENCE_TIMEOUT_SECONDS` (default 5s) with nothing new to say. No fixed recording length, so you won't get cut off mid-sentence.
+- **Text input** – Type instead of talking any time
+- **Open anything** – Apps by name, sites (YouTube, Reddit, etc.), or search on a site ("open YouTube and search for X")
+- **Web search** – Google or DuckDuckGo; open browser with search or on-site search (YouTube, Amazon, Wikipedia, etc.)
+- **To-do & notes** – "Add milk to my list", "What's on my list?", "Create a note: meeting at 3", "Clear my list"
+- **Reminders & timers** – "Remind me in 20 minutes to call mom", "Set a timer for 5 minutes" (reminders saved to disk, timers in-memory)
+- **Weather** – "What's the weather?" or "Weather in Austin" (Open-Meteo, no API key)
+- **Quick math** – "What is 15% of 80?", "Calculate 23 times 4"
+- **System** – Lock PC, volume up/down/mute/set, system info (CPU/RAM), screenshot
+- **Files & folders** – "What's on my desktop?", "Create a folder called Projects", "Open my downloads", read/write/append/delete text files
+- **Clipboard** – Read or set clipboard
+- **Camera & screen vision** – "What do you see?", "What's on my screen?" (Ollama LLaVA)
+- **Simple 3D scenes** – "Make a 3D scene of a table in Blender"
+- **Confirmation on risky actions** – deleting a file, clearing your to-do list, adding something to a shopping cart, or locking the PC all ask "yes/no" first
+- **Conversation memory** – Recent turns sent to Ollama for follow-up context within a session
+- **Persistent memory** – Facts, preferences, and habits you mention are remembered across restarts (e.g. "I use VS Code", "when I say send it, use Outlook") and pulled back in automatically when relevant. Ask "what do you know about me?" any time to see what's stored.
+- **Multi-step requests** – "Open notepad, type hello, and take a screenshot" runs as one request
+
+## Requirements
+
+- **Windows 10/11** (this project targets Windows only for now)
+- **Python 3.11 or 3.12** — **do not use 3.13/3.14 yet.** Confirmed: PyAudio has no Windows wheel past 3.13, and pydantic-core (an `ollama` dependency) has been seen installing a mismatched binary on 3.14, which breaks `import ollama` while `pip list` still shows it installed. If you already have 3.14 as your main Python, that's fine — just point this project's venv at 3.11/3.12 specifically with `py -3.12 -m venv venv` instead of `python -m venv venv`.
+- **Ollama** – [Download Ollama](https://ollama.ai) and install. Then run:
+  ```bash
+  ollama pull qwen2.5:7b
+  ollama pull llava
+  ```
+  `qwen2.5:7b` is the default chat model and **must support tool/function calling** — the whole assistant is built around it deciding which tools to call. `llava` is used for camera/screen vision. If you swap `OLLAMA_CHAT_MODEL` in `config.py` for a different model, confirm on Ollama's model page that it lists "Tools" support, or the assistant will fall back to plain chat with no ability to actually do anything.
+  This project only uses **free, local models through Ollama** — no paid API keys are required anywhere.
+- **Voice input (optional)** – For "Listen" and wake-word voice commands, install Whisper:
+  ```bash
+  pip install openai-whisper
+  ```
+  On first use it will download a small model (e.g. `base`). Without Whisper, you can still use text input and all other features.
+
+## Quick Start (full checklist — start to finish)
+
+**Run on Windows**, using **PowerShell** or **Command Prompt** (not WSL/Ubuntu). If you use Cursor or VS Code, pick "PowerShell" or "Command Prompt" as the terminal profile so commands run on Windows, not Linux.
+
+1. **Extract this project folder** somewhere on your PC (e.g. your Desktop or Documents).
+
+2. **Install Ollama** if you haven't already: [ollama.ai](https://ollama.ai) → download → install → it runs in the background automatically (check for its icon in the system tray).
+
+3. **Pull the two models it needs** (one-time, downloads a few GB):
+   ```powershell
+   ollama pull qwen2.5:7b
+   ollama pull llava
+   ```
+
+4. **Open a terminal in the project folder:**
+   ```powershell
+   cd "C:\path\to\wherever\you\extracted\this\folder"
+   ```
+
+5. **Create and activate a virtual environment** (keeps dependencies isolated — recommended):
+   ```powershell
+   python -m venv venv
+   venv\Scripts\activate
+   ```
+   You'll know it worked if your prompt now starts with `(venv)`. You'll need to run `venv\Scripts\activate` again every time you open a new terminal to run Jarvis.
+
+6. **Install dependencies:**
+   ```powershell
+   pip install pyttsx3 openwakeword numpy pyautogui pynput psutil duckduckgo-search requests opencv-python Pillow "ollama>=0.4.0" customtkinter python-dotenv pyperclip schedule
+   ```
+   Optional — **better voice (TTS)**: `pip install edge-tts "playsound==1.2.2"` (the default `config.py` already has `TTS_ENGINE = "edge"` set, so install this unless you switch it back to `"pyttsx3"`). **Use `playsound==1.2.2` specifically** — version 1.3.0 has a broken `setup.py` that fails to build on modern pip (a known upstream bug, unrelated to this project). If you skip playsound entirely, `assistant/tts.py` falls back to `pygame` or the system's default player automatically.
+   Optional — **voice input** (Listen / wake word): `pip install openai-whisper`.
+   Optional — **microphone issues**: if you see "Could not import the PyAudio C module", install [ffmpeg](https://ffmpeg.org/download.html) and add it to your PATH — the Listen button will use it instead. Wake word specifically still needs `pyaudio`.
+
+7. **(Optional) Set up Google search** — only if you want Google instead of the no-setup-required DuckDuckGo fallback. See "Using Google for web search" below.
+
+8. **Run it:**
+   ```powershell
+   python main.py
+   ```
+
+9. Say **"Hey Jarvis"** or type in the text box, then give a command — e.g. "Open Notepad", "What's the weather", "Search for Python tutorials", "What do you see?". For anything Jarvis flags as risky (deleting a file, clearing your list, adding to a cart, locking the PC), it'll ask "yes/no" before doing it — just answer normally.
+
+**Each time you come back later:** open a terminal in the project folder, run `venv\Scripts\activate`, then `python main.py`. Make sure Ollama is running (it usually auto-starts with Windows — check the system tray).
+
+## Configuration
+
+- **Wake word**: Default is "Hey Jarvis". You can change it in `config.py` (if using Porcupine you’d need a custom model; with openwakeword you can train or use a similar phrase).
+- **Voice conversation timing**: `config.CONVERSATION_SILENCE_TIMEOUT_SECONDS` (default 5s) controls both how long it'll wait for you to start talking before giving up, and how much silence means you're done talking. `config.CONVERSATION_MAX_UTTERANCE_SECONDS` (default 45s) is a hard cap so a noisy room can't keep it recording forever. If it's cutting you off too early or too late, or picking up background noise as speech, also see `VAD_SILENCE_MULTIPLIER` and `VAD_MIN_ENERGY_THRESHOLD` in `config.py`.
+- **Ollama**: Ensure Ollama is running (often starts with Windows). Default model names are in `config.py`.
+
+### Using Google for web search
+
+By default the assistant uses DuckDuckGo (no setup). To use **Google** instead:
+
+1. **API key**: In [Google Cloud Console](https://console.cloud.google.com/), create or select a project, enable **Custom Search API**, and create credentials (API key).
+2. **Search engine ID**: Go to [Programmable Search Engine](https://programmablesearchengine.google.com/), add a search engine that searches the whole web, and copy the **Search engine ID** (cx).
+
+Then copy `.env.example` to `.env` (same folder as `main.py`) and fill in:
+```
+GOOGLE_SEARCH_API_KEY=your-api-key
+GOOGLE_SEARCH_ENGINE_ID=your-search-engine-id
+```
+`.env` is gitignored and loaded automatically at startup — **never put real keys directly in `config.py`**, since that file is easy to accidentally share or commit. Google Custom Search has a **free tier of 100 queries per day**. If `.env` is missing or blank, search falls back to DuckDuckGo automatically.
+
+## Performance (slow responses)
+
+If Jarvis takes minutes to reply, check these roughly in order:
+
+1. **Model reload between messages.** By default Ollama unloads a model after 5 minutes idle, and reloading a multi-GB model from disk is usually the single biggest source of slow responses — often bigger than the actual thinking time. This project sets `OLLAMA_KEEP_ALIVE = "30m"` in `config.py` so the model stays loaded between your messages; if you're still seeing long waits specifically after a pause, try `"-1"` to keep it loaded indefinitely (costs RAM/VRAM even when idle).
+2. **CPU vs GPU.** Run `ollama ps` in a terminal while Jarvis is thinking — it shows whether the model is running on your GPU or falling back to CPU. CPU inference for a 7B model is dramatically slower (this is a hardware/driver question, not something this project's code controls).
+3. **Model size.** `qwen2.5:7b` is a solid, capable default, but on modest hardware a smaller model responds noticeably faster at some cost to how well it follows complex tool-calling instructions. To try one: `ollama pull qwen2.5:3b` (or `qwen2.5:1.5b` for the fastest option), then change `OLLAMA_CHAT_MODEL` in `config.py` to match. Confirm whatever you pick supports tool/function calling (check its Ollama model page for "Tools") or Jarvis won't be able to act on anything.
+4. **Multi-step requests take multiple model round-trips by design** — "open notepad, type hello, and take a screenshot" is 3-4 separate tool calls, each a full trip through the model. This is inherent to how the tool-calling planner works (see Phase 1 above); a single-tool request like "what's the weather" should be much faster than a chained one.
+
+## Project Structure
+
+```
+Jarvis/
+├── main.py                    # Entry point & UI
+├── config.py                  # Settings, dependency list, and behavior options
+├── .env                       # Local secrets (gitignored) - Google search key, etc.
+├── .env.example                # Template for .env
+├── jarvis_memory.db            # Persistent memory (gitignored, created on first run)
+├── assistant/
+│   ├── brain.py                # Thin compatibility shim -> delegates to agent/planner.py
+│   ├── agent/                  # Phase 1: the tool-calling planner core
+│   │   ├── planner.py           # The agentic loop: LLM decides which tools to call; injects memory context
+│   │   ├── registry.py          # @tool decorator - the plugin contract for capabilities
+│   │   ├── tools_system.py      # Desktop control: apps, keyboard, mouse, clipboard, volume
+│   │   ├── tools_files.py       # File & folder read/write/delete
+│   │   ├── tools_web.py         # Browser & web search
+│   │   ├── tools_productivity.py # Todos, notes, timers, reminders, weather, math
+│   │   ├── tools_vision.py      # Camera & screen understanding
+│   │   ├── tools_blender.py     # Simple 3D scene generation
+│   │   └── tools_memory.py      # Phase 2: remember/forget facts, preferences, procedures
+│   ├── memory/                  # Phase 2: persistent memory
+│   │   ├── db.py                 # SQLite connection & schema
+│   │   └── store.py              # CRUD + keyword-based retrieval for all 4 memory types
+│   ├── tts.py                  # Text-to-speech
+│   ├── stt.py                  # Speech-to-text (Whisper)
+│   ├── wake_word.py            # Wake word detection ("hey_jarvis" model, explicit + status-reporting)
+│   ├── computer.py             # Low-level app/mouse/keyboard/clipboard/volume implementations
+│   ├── vision.py                # Camera capture & LLaVA description
+│   ├── web_search.py            # Google or DuckDuckGo search
+│   ├── file_ops.py              # Low-level file read/write implementations
+│   ├── audio_devices.py         # Mic listing - WASAPI-deduped, format-probed
+│   ├── notes.py, reminders.py, weather.py, math_helper.py, blender_integration.py
+│   └── settings.py
+├── PHASE3_HANDOFF.md           # Paste into a new conversation to continue with Phase 3
+└── README.md
+```
+
+**Adding a new capability going forward** means adding a function to a `tools_*.py` file (or a new file) with an `@tool(...)` decorator — no need to touch the planner or brain.py at all. This is also the pattern Phase 3's plugin loader will extend for drop-in third-party plugins.
+
+## Troubleshooting
+
+**Jarvis stops listening too early, or keeps listening when you're done talking.**
+The silence detection (`assistant/stt.py`'s `listen_until_silence`) auto-calibrates against a brief sample of your room's background noise each time it starts listening, then requires audio that much louder to count as "you talking." If it's cutting you off during pauses or picking up background noise as speech, tune `VAD_SILENCE_MULTIPLIER` (raise to make it less sensitive) and `VAD_MIN_ENERGY_THRESHOLD` (raise if a quiet room is still triggering false positives) in `config.py`. `CONVERSATION_SILENCE_TIMEOUT_SECONDS` controls the actual silence duration required (default 5s) — shorten it for snappier turn-taking, lengthen it if you tend to pause mid-thought.
+
+**"Ollama package isn't installed" / import errors, but `pip show ollama` says it's there.**
+Almost always a Python version mismatch, not a missing package. Run `python --version` with your venv active — if it's 3.13 or 3.14, that's the problem: some of this project's dependencies (notably `pydantic-core`, which `ollama` needs) don't reliably have prebuilt wheels for those versions yet, and pip can end up with a binary compiled for the wrong Python ABI, which fails silently at import time. Fix: delete `venv/`, recreate it on 3.11 or 3.12 specifically (`py -3.12 -m venv venv`), and reinstall.
+
+**"Could not import the PyAudio C module '_portaudio'."**
+PyAudio only ships Windows wheels through Python 3.13. On 3.14 there's nothing for pip to install, even if something under that name shows up elsewhere on your system. Same fix as above — use a 3.11/3.12 venv — or skip voice input entirely and use the text box (everything else works without it).
+
+**`pip list` shows a package installed, but Python still can't import it.**
+Usually means you're looking at a different Python than the one actually running the app. Confirm with `python -c "import sys; print(sys.executable)"` while your venv is active — the path it prints should be inside this project's `venv` folder. If it isn't, your venv isn't actually active despite `pip` reporting things as installed elsewhere on your system.
+
+**`playsound` fails to install with `OSError: could not get source code`.**
+Known upstream bug in `playsound==1.3.0`'s packaging, unrelated to this project. Install `playsound==1.2.2` instead — it doesn't have the bug. If you'd rather skip it, `assistant/tts.py` automatically falls back to `pygame` or your system's default player.
+
+**Mic dropdown shows a dozen near-identical entries.**
+Fixed as of Phase 2 — the list is now filtered to WASAPI devices only (Windows' modern audio API, where each physical mic appears once) and each candidate is checked against the exact recording format Jarvis uses, so non-functional entries get dropped automatically. If you're still seeing duplicates, your system may not expose a WASAPI host API at all (rare) — in that case it falls back to a name-deduped list of everything else.
+
+**Wake word ("Hey Jarvis") doesn't activate.**
+Check the chat log right after startup — `wake_word.py` now reports its actual status there ("Wake word ready - listening on X" or a specific error) instead of failing silently. If it reports a download error, check your internet connection (the wake word model file downloads on first use). If it says "ready" but still doesn't trigger, try picking a different microphone from the dropdown and watch for the "listening on ..." message to confirm which device is actually active.
+
+
+## License
+</file>
+
+<file path="requirements.txt">
+# Jarvis-like Assistant - Dependencies
+# Install: pip install -r requirements.txt
+
+pyttsx3
+openwakeword
+numpy
+pyautogui
+pynput
+psutil
+duckduckgo-search
+requests
+opencv-python
+Pillow
+ollama>=0.4.0
+customtkinter
+python-dotenv
+pyperclip
+schedule
+
+# Optional - better TTS (set TTS_ENGINE = "edge" in config.py)
+# edge-tts
+# playsound
+
+# Optional - voice input (Listen, wake word transcription)
+# openai-whisper
+# pyaudio
+
+# Optional - precise volume control (set volume to X%)
+# pycaw
+# comtypes
+</file>
+
+</files>

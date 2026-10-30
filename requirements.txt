@@ -1,0 +1,34 @@
+# Jarvis-like Assistant - Dependencies
+# Install: pip install -r requirements.txt
+
+pyttsx3
+openwakeword
+numpy
+pyautogui
+pynput
+psutil
+duckduckgo-search
+requests
+opencv-python
+Pillow
+ollama>=0.4.0
+customtkinter
+python-dotenv
+pyperclip
+schedule
+fastapi
+uvicorn
+twilio
+
+
+# Optional - better TTS (set TTS_ENGINE = "edge" in config.py)
+# edge-tts
+# playsound
+
+# Optional - voice input (Listen, wake word transcription)
+# openai-whisper
+# pyaudio
+
+# Optional - precise volume control (set volume to X%)
+# pycaw
+# comtypes
